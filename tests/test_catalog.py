@@ -5,6 +5,7 @@ Run with: python3 -m pytest tests -q   (or: python3 tests/test_catalog.py)
 from __future__ import annotations
 
 import json
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -253,6 +254,123 @@ def test_plan_emits_every_url_when_unlimited():
     urls += [f"https://x/p/vidja-floor-lamp-{i}-20000{i}" for i in range(3)]
     out = plan(urls)
     assert sorted(out) == sorted(urls), "stratifying must not drop or duplicate URLs"
+
+
+# -- product families ------------------------------------------------------
+def _slug_id(name):
+    # Full slug: truncating collided 140/160/180 onto one key and silently
+    # collapsed the fixture to a single product.
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def _ikea(name, range_name, type_name):
+    p = _product(_slug_id(name), 12990.0, name)
+    p.attributes = {"range_name": range_name, "type_name": type_name}
+    p.source = "ikea_in"
+    return p
+
+
+def test_variants_of_one_range_share_a_family():
+    from catalog.family import resolve
+    sizes = [_ikea(f"MALM Bed frame - white {w}x200 cm", "MALM", "bed frame")
+             for w in (140, 160, 180)]
+    sizes.append(_ikea("MALM Bed frame - black-brown 180x200 cm", "MALM", "bed frame"))
+    keys = {resolve(p)[0] for p in sizes}
+    assert len(keys) == 1, "one model line, whatever the size or colour"
+    assert resolve(sizes[0])[1] == "MALM bed frame"
+    # ... and a different article type is a different family
+    other = _ikea("MALM Chest of 3 drawers - white", "MALM", "chest of drawers")
+    assert resolve(other)[0] != resolve(sizes[0])[0]
+
+
+def test_family_is_scoped_to_its_retailer():
+    from catalog.family import resolve
+    a = _ikea("MALM Bed frame - white", "MALM", "bed frame")
+    b = _ikea("MALM Bed frame - white", "MALM", "bed frame")
+    b.source = "homerun"
+    b.attributes = {}
+    assert resolve(a)[0].startswith("ikea_in:")
+    assert resolve(b)[0].startswith("homerun:")
+    assert resolve(a)[0] != resolve(b)[0]
+
+
+def test_homerun_family_drops_the_pack_size():
+    from catalog.family import resolve
+    a = _product("c1", 355.0, "Maha PPC Cement, 50 Kg Bag")
+    b = _product("c2", 40.0, "Maha PPC Cement, 1 Kg Pack")
+    a.source = b.source = "homerun"
+    assert resolve(a)[0] == resolve(b)[0]
+    assert resolve(a)[1] == "Maha PPC Cement"
+    assert "50 Kg Bag" in resolve(a)[2]
+
+
+def test_search_collapses_to_one_sku_per_family(tmp_path="/tmp"):
+    from catalog.search import find_products
+    db = Path(tmp_path) / "families.db"
+    db.unlink(missing_ok=True)
+    conn = store.connect(db)
+    products = [_ikea(f"MALM Bed frame - white {w}x200 cm", "MALM", "bed frame")
+                for w in (140, 160, 180)]
+    products.append(_ikea("HEMNES Bed frame - white 160x200 cm", "HEMNES", "bed frame"))
+    for p in products:
+        p.design_category = "beds"
+    store.upsert(conn, products)
+
+    raw = find_products(conn, "bed frame white", k=4)
+    assert len(raw) == 4, "without collapsing, one range fills the result"
+    collapsed = find_products(conn, "bed frame white", k=4, collapse_families=True)
+    assert len(collapsed) == 2, "MALM and HEMNES are two choices, not four"
+    malm = next(m for m in collapsed if "MALM" in m.name)
+    assert malm.family_size == 3, "and the caller is told how many sizes exist"
+    db.unlink(missing_ok=True)
+
+
+def test_variant_lookup_returns_the_whole_line(tmp_path="/tmp"):
+    from catalog.search import get_family
+    from catalog.family import resolve
+    db = Path(tmp_path) / "variants.db"
+    db.unlink(missing_ok=True)
+    conn = store.connect(db)
+    products = [_ikea(f"MALM Bed frame - white {w}x200 cm", "MALM", "bed frame")
+                for w in (140, 160, 180)]
+    store.upsert(conn, products)
+    fam = get_family(conn, resolve(products[0])[0])
+    assert fam["count"] == 3
+    assert {v["variant_label"] for v in fam["variants"]}, "each variant is labelled"
+    db.unlink(missing_ok=True)
+
+
+# -- embedding versioning --------------------------------------------------
+def test_embeddings_are_keyed_by_model_and_version(tmp_path="/tmp"):
+    from catalog.embed import asset_id
+    db = Path(tmp_path) / "emb.db"
+    db.unlink(missing_ok=True)
+    conn = store.connect(db)
+    store.upsert(conn, [_product()])
+    key = _product().key
+    asset = asset_id("some product text")
+    rows = [
+        (key, "text", asset, "clip-vitb32", "laion2b_s34b_b79k", 4, b"\x00" * 16, "t0"),
+        (key, "text", asset, "furniture-v2", "2026-09", 8, b"\x00" * 32, "t1"),
+    ]
+    conn.executemany(
+        "INSERT OR REPLACE INTO embeddings "
+        "(product_key,kind,source_asset,model,model_version,dim,vec,created_at) "
+        "VALUES (?,?,?,?,?,?,?,?)", rows)
+    conn.commit()
+    # A second representation must not evict the one currently serving.
+    assert conn.execute("SELECT COUNT(*) c FROM embeddings").fetchone()["c"] == 2
+    dims = {r["dim"] for r in conn.execute("SELECT dim FROM embeddings")}
+    assert dims == {4, 8}, "each model keeps its own dimensionality"
+    db.unlink(missing_ok=True)
+
+
+def test_asset_id_ties_a_vector_to_the_bytes_it_came_from():
+    from catalog.embed import asset_id
+    assert asset_id("a") == asset_id("a")
+    assert asset_id("a") != asset_id("b")
+    assert asset_id(b"a") == asset_id("a"), "bytes and text address identically"
+    assert asset_id("a").startswith("sha256:")
 
 
 # -- IKEA offer parsing ----------------------------------------------------

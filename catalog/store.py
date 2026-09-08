@@ -17,8 +17,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from .family import FAMILY_COLUMNS, resolve as resolve_family
 from .models import Product
 from .quality import QUALITY_COLUMNS, assess
+
+# Everything derived on write, and therefore everything a migration must add to
+# a database created before these existed.
+DERIVED_COLUMNS = {**QUALITY_COLUMNS, **FAMILY_COLUMNS}
 
 log = logging.getLogger(__name__)
 
@@ -82,7 +87,12 @@ CREATE TABLE IF NOT EXISTS products (
     render_asset_quality    INTEGER DEFAULT 0,
     searchable              INTEGER DEFAULT 0,
     design_eligible         INTEGER DEFAULT 0,
-    quality_gaps            TEXT
+    quality_gaps            TEXT,
+    -- The model line this SKU belongs to. MALM bed 140 and MALM bed 180 are two
+    -- SKUs and one piece of furniture; retrieval collapses on this.
+    family_key              TEXT,
+    family_label            TEXT,
+    variant_label           TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_products_design  ON products(design_category);
 CREATE INDEX IF NOT EXISTS idx_products_source  ON products(source);
@@ -127,14 +137,37 @@ CREATE TABLE IF NOT EXISTS price_history (
     PRIMARY KEY (product_key, observed_at)
 );
 
+-- Being in the catalogue is not the same as being buyable where the customer
+-- lives. Unused by the prototype; the shape is here so a per-pincode stock feed
+-- can be recorded without reshaping the catalogue.
+CREATE TABLE IF NOT EXISTS product_availability (
+    product_key     TEXT NOT NULL REFERENCES products(key) ON DELETE CASCADE,
+    country         TEXT NOT NULL DEFAULT 'IN',
+    region          TEXT NOT NULL DEFAULT '',
+    postal_code     TEXT NOT NULL DEFAULT '',
+    stock_status    TEXT,
+    delivery_status TEXT,
+    observed_at     TEXT NOT NULL,
+    PRIMARY KEY (product_key, country, region, postal_code)
+);
+
+-- Nothing here assumes one embedding per product. A better furniture
+-- representation will come along, and it has to be possible to compute it
+-- beside CLIP, compare retrieval quality on the same catalogue, and switch --
+-- without destroying the index that is currently serving. Model and version are
+-- separate columns so "same model, retrained weights" is expressible, and
+-- source_asset is content-addressed so a vector can be tied to the exact bytes
+-- it was computed from rather than a URL the retailer may reuse.
 CREATE TABLE IF NOT EXISTS embeddings (
-    product_key TEXT NOT NULL REFERENCES products(key) ON DELETE CASCADE,
-    kind        TEXT NOT NULL,      -- 'text' | 'image'
-    ref         TEXT NOT NULL,      -- '' for text, image url for image
-    model       TEXT NOT NULL,
-    dim         INTEGER NOT NULL,
-    vec         BLOB NOT NULL,      -- float32, L2-normalised
-    PRIMARY KEY (product_key, kind, ref, model)
+    product_key   TEXT NOT NULL REFERENCES products(key) ON DELETE CASCADE,
+    kind          TEXT NOT NULL,      -- 'text' | 'image'
+    source_asset  TEXT NOT NULL,      -- 'sha256:...' of the bytes or text embedded
+    model         TEXT NOT NULL,      -- 'clip-vit-b32'
+    model_version TEXT NOT NULL,      -- 'laion2b_s34b_b79k'
+    dim           INTEGER NOT NULL,
+    vec           BLOB NOT NULL,      -- float32, L2-normalised
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (product_key, kind, source_asset, model, model_version)
 );
 
 CREATE TABLE IF NOT EXISTS crawl_runs (
@@ -168,7 +201,7 @@ _PRODUCT_COLS = [
     "dimension_text", "weight_kg", "materials", "colors", "tags", "rating",
     "review_count", "country", "attributes", "raw", "embedding_text", "content_hash",
     "first_seen", "last_seen",
-] + list(QUALITY_COLUMNS)
+] + list(DERIVED_COLUMNS)
 
 
 _UPSERT_SQL = (
@@ -199,10 +232,24 @@ def _migrate(conn: sqlite3.Connection) -> None:
     CREATE TABLE IF NOT EXISTS silently leaves an existing table alone, so new
     columns have to be added explicitly or a live catalogue breaks on upgrade.
     """
+    emb = {r["name"] for r in conn.execute("PRAGMA table_info(embeddings)")}
+    if emb and "model_version" not in emb:
+        rows = conn.execute("SELECT COUNT(*) c FROM embeddings").fetchone()["c"]
+        if rows == 0:
+            conn.execute("DROP TABLE embeddings")
+            conn.executescript(SCHEMA)
+            log.info("rebuilt embeddings table with model versioning")
+        else:
+            # Keep the vectors; split the model identifier they were written with.
+            conn.execute("ALTER TABLE embeddings ADD COLUMN model_version TEXT DEFAULT ''")
+            conn.execute("ALTER TABLE embeddings ADD COLUMN created_at TEXT DEFAULT ''")
+            log.warning("embeddings migrated in place; %d rows keep their old "
+                        "composite model id", rows)
+
     have = {r["name"] for r in conn.execute("PRAGMA table_info(products)")}
-    added = [c for c in QUALITY_COLUMNS if c not in have]
+    added = [c for c in DERIVED_COLUMNS if c not in have]
     for col in added:
-        conn.execute(f"ALTER TABLE products ADD COLUMN {col} {QUALITY_COLUMNS[col]}")
+        conn.execute(f"ALTER TABLE products ADD COLUMN {col} {DERIVED_COLUMNS[col]}")
     if added:
         # Existing rows have NULL in the new columns and would be skipped as
         # "unchanged" forever, so clear the hash to force one re-derivation.
@@ -215,6 +262,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_products_eligible ON products(design_eligible);"
         "CREATE INDEX IF NOT EXISTS idx_products_searchable ON products(searchable);"
         "CREATE INDEX IF NOT EXISTS idx_products_geometry ON products(placement_geometry);"
+        "CREATE INDEX IF NOT EXISTS idx_products_family ON products(family_key);"
+        "CREATE INDEX IF NOT EXISTS idx_emb_model ON embeddings(model, model_version, kind);"
     )
     conn.commit()
 
@@ -230,7 +279,7 @@ def _content_hash(p: Product) -> str:
         p.url, p.name, p.brand, p.price, p.compare_at_price, p.availability,
         p.price_unit, p.sku, p.description, p.materials, p.colors, p.tags,
         p.dimensions, p.weight_kg, [i.url for i in p.images], p.category_path,
-        p.category, p.product_type, p.design_category, p.rating,
+        p.category, p.product_type, p.design_category, p.rating, resolve_family(p)[0],
         [(v.variant_id, v.price, v.available, v.quantity) for v in p.variants],
     ])
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
@@ -280,6 +329,10 @@ def upsert(conn: sqlite3.Connection, products: Iterable[Product]) -> dict[str, i
         marks = assess(p, last_seen=now)
         marks["quality_gaps"] = _j(marks["quality_gaps"])
         values.update(marks)
+
+        family_key, family_label, variant_label = resolve_family(p)
+        values.update(family_key=family_key, family_label=family_label,
+                      variant_label=variant_label)
         # A real upsert, not INSERT OR REPLACE: REPLACE deletes the existing row
         # first, and the ON DELETE CASCADE on price_history would take the whole
         # price series with it every time a product was re-crawled.

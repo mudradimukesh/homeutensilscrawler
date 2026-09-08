@@ -155,10 +155,20 @@ def coverage(conn, weights: dict[str, int] | None = None, target_total: int | No
 
 def format_coverage(cov: dict) -> str:
     lines = [f"catalogue coverage: {cov['total']:,} products",
-             f"  {'category':<18}{'weight':>7}{'have':>8}{'target':>9}"]
+             f"  {'category':<18}{'wt':>4}{'SKUs':>7}{'families':>10}"
+             f"{'placeable':>11}{'src':>5}{'target':>8}"]
     for cat, d in cov["categories"].items():
-        flag = "" if d["have"] >= d["target"] else "  <-- thin"
-        lines.append(f"  {cat:<18}{d['weight']:>7}{d['have']:>8,}{d['target']:>9,}{flag}")
+        # A designer chooses between families, not SKUs: 50 beds that are 3
+        # ranges in 6 sizes each is not 50 choices.
+        fams = d.get("families")
+        flag = "" if d["have"] >= d["target"] else "  thin"
+        if fams and fams < max(d["target"] // 3, 3):
+            flag = "  FEW FAMILIES"
+        lines.append(
+            f"  {cat:<18}{d['weight']:>4}{d['have']:>7,}"
+            f"{(fams if fams is not None else '-'):>10}"
+            f"{d.get('placeable_families', '-'):>11}{d.get('sources', '-'):>5}"
+            f"{d['target']:>8,}{flag}")
     if cov["empty_categories"]:
         lines.append("  EMPTY, and needed for room design: "
                      + ", ".join(cov["empty_categories"]))

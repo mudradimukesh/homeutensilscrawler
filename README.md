@@ -160,8 +160,22 @@ Measuring the tree on every write would cost more than the writes, so the total 
 once and tracked as bytes are written; the walk is repeated only near the limit, where drift
 would otherwise decide the outcome.
 
-When you hit it, `data/cache/` and `data/thumbs/` are regenerable — deleting them frees space
-without losing any catalogue data.
+When you hit it, the stores are not equally disposable:
+
+| Store | Role | If deleted |
+|---|---|---|
+| `thumbs/` | derived display copies | free to delete, rebuilt on demand |
+| `cache/` | fetched HTML, gzipped | rebuildable, but it is the **cheap cold source**: it is what lets you improve the parser tomorrow and recover a field you did not normalise today, without re-crawling |
+| `images/` | product photography, content-addressed | **treat as durable**. Re-downloadable only while the retailer still serves that URL — listings get replaced, reordered and discontinued, and a saved design that refers to `(sku, image sha256)` must still render years later |
+| `*.jsonl` | canonical normalised observations | **durable**. The replayable record of what each crawl saw |
+| `catalog.db` | query state | derived; rebuilt from JSONL by `load` |
+
+Delete `thumbs/` first, then `cache/` if you must. `images/` and the JSONL are the snapshot.
+
+A caveat on the JSONL's completeness: each record keeps the retailer's own embedded product
+payload verbatim under `raw` — IKEA's sales-item block and JSON-LD, HomeRun's Shopify object —
+alongside the normalised fields, so most re-parsing needs no HTML. It does not keep the entire
+page, so `cache/` still holds information the JSONL cannot reconstruct.
 
 ## Vector DB or a normal DB?
 
@@ -207,8 +221,42 @@ So: `products` and `product_images` each carry a `vector(512)` column, an HNSW i
 next to the ordinary B-tree indexes on price and category, and one query does the whole
 job. `catalog/postgres.sql` has the schema and the exact query shape.
 
-Revisit this if the catalogue passes a few million images, if you need multi-tenant vector
-isolation, or if embedding throughput — not search — becomes the bottleneck.
+**When to actually move.** Not simply "more than one process" — SQLite serves many concurrent
+readers well and handles multiple processes fine under a single-writer pattern, which is what a
+nightly crawl plus a read-only API already is. Move when you need concurrent *writers*, remote
+database access, higher API concurrency, distributed workers, vector retrieval past a few
+million rows, or operational HA.
+
+### The vector layer is versioned
+
+Nothing assumes one embedding per product. `embeddings` is keyed by
+`(product_key, kind, source_asset, model, model_version)`, so a new representation can be
+computed *beside* CLIP, compared on the same catalogue, and promoted — without destroying the
+index currently serving. Text and image vectors are separate rows rather than one blended
+vector, and `source_asset` is the content hash of exactly what was embedded, so an edited
+description or a replaced photograph yields a new vector instead of silently reusing a stale
+one.
+
+## Families, not SKUs
+
+MALM bed white 140, MALM bed white 160 and MALM bed black 180 are three SKUs and one piece of
+furniture. Ask for five beds off raw SKUs and you can get five sizes of one range — measured on
+the live catalogue, wardrobes average **five SKUs per family**, and 393 wardrobe SKUs are only
+68 families.
+
+Every product carries a `family_key`, so retrieval can collapse to one result per model line:
+
+```bash
+python3 -m catalog search "wardrobe with doors" --collapse
+python3 -m catalog family ikea_in:pax-gullaberg|wardrobe-combination
+```
+
+"I like this bed but I need the 180 cm version" is then a variant lookup, not another semantic
+search — the design has already chosen the product.
+
+`catalog coverage` reports both counts, because the second is the one that matters: a category
+with 397 SKUs and 127 families offers 127 choices, and if only 110 of those families are
+placeable it offers 110.
 
 ## How the design AI uses it
 
@@ -306,10 +354,12 @@ catalog/
   embed.py        CLIP text and image embeddings
   search.py       hybrid retrieval + design pricing
   budget.py       the disk ceiling, enforced at every large write
+  quality.py      completeness scoring: searchable vs design_eligible
+  family.py       model-line resolution, so variants collapse
   refresh.py      one scheduled refresh cycle, with a lock and a change report
   schedule.py     launchd agent (systemd/cron equivalents for Linux)
   web.py          read-only JSON API + the browser view, standard library only
   static/         the single-page UI
   postgres.sql    the same schema on Postgres + pgvector
-tests/            25 network-free tests: python3 tests/test_catalog.py
+tests/            49 network-free tests: python3 tests/test_catalog.py
 ```

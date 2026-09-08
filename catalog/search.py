@@ -62,6 +62,11 @@ class Match:
     design_eligible: bool = False
     placement_geometry: str | None = None
     quality_gaps: list[str] = field(default_factory=list)
+    family_key: str | None = None
+    family_label: str | None = None
+    variant_label: str | None = None
+    family_size: int = 1
+    price_state: str = "unknown"     # fresh | stale | unknown
     image: str | None = None
     score: float = 0.0
     signals: dict[str, float] = field(default_factory=dict)
@@ -145,6 +150,7 @@ def find_products(
     embedder: Embedder | None = None,
     candidate_pool: int = 400,
     eligible_only: bool | str = False,
+    collapse_families: bool = False,
 ) -> list[Match]:
     """Hybrid search over the catalogue. Works with keywords alone if nothing is embedded.
 
@@ -208,8 +214,70 @@ def find_products(
             fused[key] = fused.get(key, 0.0) + score
             signals.setdefault(key, {})[name] = round(score, 6)
 
-    top = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)[:k]
-    return _hydrate(conn, top, signals)
+    ranked = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
+    if not collapse_families:
+        return _hydrate(conn, ranked[:k], signals)
+
+    # Over-fetch, then keep the best SKU per model line. Without this, "five
+    # wardrobes" can come back as five sizes of one range: measured on the live
+    # catalogue, wardrobes average five SKUs per family.
+    hydrated = _hydrate(conn, ranked[: max(k * 6, 60)], signals)
+    best: list[Match] = []
+    seen: set[str] = set()
+    for m in hydrated:
+        fam = m.family_key or m.key
+        if fam in seen:
+            continue
+        seen.add(fam)
+        best.append(m)
+        if len(best) >= k:
+            break
+    _attach_family_sizes(conn, best)
+    return best
+
+
+def _attach_family_sizes(conn, matches: Sequence[Match]) -> None:
+    families = [m.family_key for m in matches if m.family_key]
+    if not families:
+        return
+    counts = {
+        r["family_key"]: r["n"]
+        for r in conn.execute(
+            f"SELECT family_key, COUNT(*) n FROM products "
+            f"WHERE family_key IN ({','.join('?' * len(families))}) GROUP BY 1", families)
+    }
+    for m in matches:
+        m.family_size = counts.get(m.family_key or "", 1)
+
+
+def get_family(conn: sqlite3.Connection, family_key: str) -> dict[str, Any]:
+    """Every SKU in a model line — the variant lookup behind "I need the 180 cm one".
+
+    A size or colour change is a lookup, not another semantic search: the design
+    has already chosen the product.
+    """
+    rows = conn.execute(
+        "SELECT * FROM products WHERE family_key = ? "
+        "ORDER BY price IS NULL, price, name", (family_key,)
+    ).fetchall()
+    if not rows:
+        return {"family_key": family_key, "variants": [], "count": 0}
+    scored = [(r["key"], 0.0) for r in rows]
+    matches = _hydrate(conn, scored, {})
+    by_key = {r["key"]: r for r in rows}
+    return {
+        "family_key": family_key,
+        "family_label": rows[0]["family_label"],
+        "count": len(rows),
+        "design_category": rows[0]["design_category"],
+        "variants": [
+            {**m.to_dict(),
+             "variant_label": by_key[m.key]["variant_label"],
+             "dimensions": json.loads(by_key[m.key]["dimensions"] or "{}"),
+             "colors": json.loads(by_key[m.key]["colors"] or "[]")}
+            for m in matches
+        ],
+    }
 
 
 def _vector_rank(
@@ -256,6 +324,10 @@ def _hydrate(conn, scored: Sequence[tuple[str, float]], signals: dict) -> list[M
             design_eligible=bool(r["design_eligible"]),
             placement_geometry=r["placement_geometry"],
             quality_gaps=json.loads(r["quality_gaps"] or "[]"),
+            family_key=r["family_key"], family_label=r["family_label"],
+            variant_label=r["variant_label"],
+            price_state=("unknown" if r["price"] is None
+                         else "fresh" if r["price_current"] else "stale"),
             image=images.get(key), score=round(score, 6), signals=signals.get(key, {}),
         ))
     return out
@@ -347,6 +419,7 @@ def price_design(
             k=alternates + 4,
             embedder=embedder,
             eligible_only=eligible_only,
+            collapse_families=True,      # alternates should be different products
         )
         if not matches:
             # Say which wall was hit: nothing in the catalogue, or nothing in it
@@ -397,9 +470,18 @@ def price_design(
             note=None if unit is not None else "matched, but the source lists no price",
         ))
 
+    # A six-month-old price silently folded into a total is worse than a
+    # missing one, so the states are counted out rather than summed together.
+    states = {"fresh": 0.0, "stale": 0.0, "unknown": 0.0}
+    for line in lines:
+        if line.matched and line.line_total is not None:
+            states[line.matched.price_state] = (
+                states[line.matched.price_state] + line.line_total)
     return {
         "currency": "INR",
         "subtotal": round(total, 2),
+        "subtotal_by_price_state": {k: round(v, 2) for k, v in states.items()},
+        "priced_on_stale_data": round(states["stale"], 2),
         "items_priced": sum(1 for line in lines if line.line_total is not None),
         "items_unmatched": unmatched,
         "items_low_confidence": low_confidence,

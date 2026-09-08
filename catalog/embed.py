@@ -11,9 +11,11 @@ and a plain SQL price lookup work without it.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -37,8 +39,18 @@ class Embedder:
         self._device = "cpu"
 
     @property
-    def key(self) -> str:
-        return f"open_clip/{self.model_name}/{self.pretrained}"
+    def model_id(self) -> str:
+        """Stable name of the representation, independent of its weights."""
+        return f"clip-{self.model_name.lower().replace('-', '')}"
+
+    @property
+    def version(self) -> str:
+        """Which weights produced these vectors."""
+        return self.pretrained
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return self.model_id, self.version
 
     def _load(self):
         if self._model is not None:
@@ -104,10 +116,17 @@ class Embedder:
 # --------------------------------------------------------------------------
 # persistence
 # --------------------------------------------------------------------------
+def asset_id(payload: bytes | str) -> str:
+    """Content address for whatever was embedded, so a vector is tied to bytes."""
+    data = payload.encode("utf-8") if isinstance(payload, str) else payload
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
 def _store(conn, rows: Iterable[tuple]) -> None:
     conn.executemany(
-        "INSERT OR REPLACE INTO embeddings (product_key,kind,ref,model,dim,vec) "
-        "VALUES (?,?,?,?,?,?)",
+        "INSERT OR REPLACE INTO embeddings "
+        "(product_key,kind,source_asset,model,model_version,dim,vec,created_at) "
+        "VALUES (?,?,?,?,?,?,?,?)",
         rows,
     )
     conn.commit()
@@ -123,39 +142,46 @@ def embed_catalog(
     limit: int | None = None,
 ) -> dict[str, int]:
     counts = {"text": 0, "image": 0, "skipped_images": 0}
-    model = embedder.key
+    model, version = embedder.key
+    now = datetime.now(timezone.utc).isoformat()
 
     if do_text:
         sql = """
             SELECT p.key, p.embedding_text FROM products p
              WHERE p.embedding_text IS NOT NULL AND p.embedding_text <> ''
                AND NOT EXISTS (SELECT 1 FROM embeddings e
-                                WHERE e.product_key=p.key AND e.kind='text' AND e.model=?)
+                                WHERE e.product_key=p.key AND e.kind='text'
+                                  AND e.model=? AND e.model_version=?)
         """
         if limit:
             sql += f" LIMIT {int(limit)}"
-        rows = conn.execute(sql, (model,)).fetchall()
+        rows = conn.execute(sql, (model, version)).fetchall()
         log.info("text embeddings to compute: %d", len(rows))
         for i in range(0, len(rows), batch):
             part = rows[i:i + batch]
             vecs = embedder.embed_texts([r["embedding_text"] for r in part])
             _store(conn, [
-                (r["key"], "text", "", model, vecs.shape[1], vecs[j].tobytes())
+                # Addressing the text by its hash means an edited description
+                # produces a new vector instead of silently reusing a stale one.
+                (r["key"], "text", asset_id(r["embedding_text"]), model, version,
+                 vecs.shape[1], vecs[j].tobytes(), now)
                 for j, r in enumerate(part)
             ])
             counts["text"] += len(part)
 
     if do_images:
         sql = f"""
-            SELECT i.product_key, i.url, i.local_path FROM product_images i
-             WHERE i.local_path IS NOT NULL AND i.position < {int(images_per_product)}
+            SELECT i.product_key, i.url, i.local_path, i.sha256 FROM product_images i
+             WHERE i.local_path IS NOT NULL AND i.sha256 IS NOT NULL
+               AND i.position < {int(images_per_product)}
                AND NOT EXISTS (SELECT 1 FROM embeddings e
                                 WHERE e.product_key=i.product_key AND e.kind='image'
-                                  AND e.ref=i.url AND e.model=?)
+                                  AND e.source_asset='sha256:' || i.sha256
+                                  AND e.model=? AND e.model_version=?)
         """
         if limit:
             sql += f" LIMIT {int(limit)}"
-        rows = conn.execute(sql, (model,)).fetchall()
+        rows = conn.execute(sql, (model, version)).fetchall()
         log.info("image embeddings to compute: %d", len(rows))
         for i in range(0, len(rows), 32):
             part = rows[i:i + 32]
@@ -176,7 +202,8 @@ def embed_catalog(
                 counts["skipped_images"] += len(paths)
                 continue
             _store(conn, [
-                (r["product_key"], "image", r["url"], model, vecs.shape[1], vecs[j].tobytes())
+                (r["product_key"], "image", "sha256:" + r["sha256"], model, version,
+                 vecs.shape[1], vecs[j].tobytes(), now)
                 for j, r in enumerate(keep)
             ])
             counts["image"] += len(keep)
@@ -185,15 +212,18 @@ def embed_catalog(
 
 
 def load_matrix(
-    conn: sqlite3.Connection, kind: str, model: str, keys: Sequence[str] | None = None
+    conn: sqlite3.Connection, kind: str, model: tuple[str, str] | str,
+    keys: Sequence[str] | None = None
 ) -> tuple[list[str], np.ndarray]:
     """All stored vectors of one kind as a matrix, with the product key per row.
 
     Brute force over ~13k products is a sub-millisecond dot product; an ANN index
     only starts paying for itself a couple of orders of magnitude further up.
     """
-    sql = "SELECT product_key, ref, vec, dim FROM embeddings WHERE kind=? AND model=?"
-    params: list = [kind, model]
+    model_id, version = model if isinstance(model, tuple) else (model, "")
+    sql = ("SELECT product_key, source_asset, vec, dim FROM embeddings "
+           "WHERE kind=? AND model=? AND model_version=?")
+    params: list = [kind, model_id, version]
     if keys:
         sql += f" AND product_key IN ({','.join('?' * len(keys))})"
         params += list(keys)

@@ -15,7 +15,7 @@ from .pipeline import scrape
 from .budget import DEFAULT_LIMIT, DiskBudget, parse_size, report as disk_report
 from .stratify import coverage, format_coverage, format_summary, plan_summary
 from .taxonomy import DEFAULT_WEIGHTS
-from .search import dump, find_products, price_design
+from .search import dump, find_products, get_family, price_design
 from .sources import SOURCES
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -93,6 +93,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--in-stock", action="store_true")
     p.add_argument("--eligible", action="store_true",
                    help="only products complete enough to place in a room")
+    p.add_argument("--collapse", action="store_true",
+                   help="one result per model line, not five sizes of the same range")
     p.add_argument("-k", type=int, default=10)
     p.add_argument("--json", action="store_true")
     p.add_argument("--no-vectors", action="store_true", help="keyword only, no CLIP")
@@ -159,6 +161,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--target-total", type=int,
                    help="score coverage as if the catalogue held this many products")
     p.add_argument("--weights")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("family", help="every SKU in a model line — the variant lookup")
+    p.add_argument("key", help="a family_key, or a product key to look up its family")
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("quality", help="how much of the catalogue is complete enough to place")
@@ -238,7 +244,7 @@ def main(argv: list[str] | None = None) -> int:
             design_category=args.category, min_price=args.min_price,
             max_price=args.max_price, source=args.source,
             in_stock_only=args.in_stock, k=args.k, embedder=_embedder(args),
-            eligible_only=args.eligible,
+            eligible_only=args.eligible, collapse_families=args.collapse,
         )
         if args.json:
             print(dump([r.to_dict() for r in results]))
@@ -246,8 +252,11 @@ def main(argv: list[str] | None = None) -> int:
             for i, r in enumerate(results, 1):
                 price = f"Rs.{r.price:,.0f}" if r.price is not None else "no price"
                 unit = f" {r.price_unit}" if r.price_unit else ""
+                siblings = f"  +{r.family_size - 1} more sizes/colours" if r.family_size > 1 else ""
                 print(f"{i:2}. {r.name[:68]:<68} {price:>12}{unit}")
-                print(f"    {r.source} | {r.design_category or '-'} | {r.availability} | {r.url}")
+                print(f"    {r.source} | {r.design_category or '-'} | {r.availability}"
+                      f"{' | placeable' if r.design_eligible else ''}{siblings}")
+                print(f"    {r.url}")
         return 0
 
     if args.cmd == "price":
@@ -306,8 +315,46 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "coverage":
-        cov = coverage(store.connect(args.db), _weights(args.weights), args.target_total)
+        conn = store.connect(args.db)
+        cov = coverage(conn, _weights(args.weights), args.target_total)
+        # SKU count flatters a catalogue; the family count is what a designer
+        # can actually choose between.
+        for r in conn.execute(
+            "SELECT COALESCE(design_category,'(none)') c, COUNT(*) n, "
+            "COUNT(DISTINCT family_key) f, SUM(design_eligible) e, "
+            "COUNT(DISTINCT CASE WHEN design_eligible THEN family_key END) ef, "
+            "COUNT(DISTINCT source) s FROM products GROUP BY 1"
+        ):
+            entry = cov["categories"].get(r["c"])
+            if entry is not None:
+                entry.update(families=r["f"], eligible=r["e"] or 0,
+                             placeable_families=r["ef"] or 0, sources=r["s"])
         print(dump(cov) if args.json else format_coverage(cov))
+        return 0
+
+    if args.cmd == "family":
+        conn = store.connect(args.db)
+        key = args.key
+        if ":" in key and "|" not in key:
+            row = conn.execute("SELECT family_key FROM products WHERE key = ?", (key,)).fetchone()
+            if row:
+                key = row["family_key"]
+        fam = get_family(conn, key)
+        if args.json:
+            print(dump(fam))
+            return 0
+        if not fam["count"]:
+            print(f"no family {key!r}")
+            return 1
+        print(f"{fam['family_label']}  ({fam['count']} variants · {fam['design_category']})\n")
+        for v in fam["variants"]:
+            price = f"Rs.{v['price']:,.0f}" if v["price"] is not None else "no price"
+            dims = v["dimensions"]
+            size = " x ".join(
+                f"{int(dims[a])}" for a in ("width_mm", "depth_mm", "length_mm", "height_mm")
+                if dims.get(a)) or "-"
+            mark = "placeable" if v["design_eligible"] else "         "
+            print(f"  {price:>11}  {mark}  {size:>18} mm  {v['variant_label'][:42]:<42} {v['key']}")
         return 0
 
     if args.cmd == "quality":
