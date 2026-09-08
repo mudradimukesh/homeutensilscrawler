@@ -13,6 +13,8 @@ from .http import Fetcher
 from .images import download_missing
 from .pipeline import scrape
 from .budget import DEFAULT_LIMIT, DiskBudget, parse_size, report as disk_report
+from .stratify import coverage, format_coverage, format_summary, plan_summary
+from .taxonomy import DEFAULT_WEIGHTS
 from .search import dump, find_products, price_design
 from .sources import SOURCES
 
@@ -21,6 +23,14 @@ DATA = ROOT / "data"
 DEFAULT_DB = DATA / "catalog.db"
 DEFAULT_CACHE = DATA / "cache"
 DEFAULT_IMAGES = DATA / "images"
+
+
+def _weights(path: str | None) -> dict[str, int] | None:
+    """Category weights from a JSON file, merged over the defaults."""
+    if not path:
+        return None
+    overrides = json.loads(Path(path).read_text(encoding="utf-8"))
+    return {**DEFAULT_WEIGHTS, **{k: int(v) for k, v in overrides.items()}}
 
 
 def _embedder(args) -> Embedder | None:
@@ -46,9 +56,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--reparse", action="store_true",
                    help="rebuild the JSONL from cached pages after a parser change (no requests)")
     p.add_argument("--no-robots", action="store_true", help="skip robots.txt checks")
+    p.add_argument("--strategy", choices=["stratified", "sitemap"], default="stratified",
+                   help="stratified keeps every prefix of the crawl category-balanced")
+    p.add_argument("--weights", help="JSON file of category weights, overriding the defaults")
     p.add_argument("--max-data-size", default="1GB",
                    help="stop when data/ reaches this size (default 1GB; 0 = no limit)")
-
 
     p = sub.add_parser("load", help="load JSONL into the database")
     p.add_argument("files", nargs="*", help="default: every data/*.jsonl")
@@ -135,6 +147,18 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--images", default=str(DEFAULT_IMAGES))
     p.add_argument("--max-data-size", default="1GB")
 
+    p = sub.add_parser("plan", help="preview the crawl order without fetching anything")
+    p.add_argument("source", choices=sorted(SOURCES))
+    p.add_argument("--limit", type=int)
+    p.add_argument("--weights")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("coverage", help="per-category counts against the weighted targets")
+    p.add_argument("--target-total", type=int,
+                   help="score coverage as if the catalogue held this many products")
+    p.add_argument("--weights")
+    p.add_argument("--json", action="store_true")
+
     p = sub.add_parser("du", help="how much disk the catalogue is using")
     p.add_argument("--max-data-size", default="1GB")
     p.add_argument("--json", action="store_true")
@@ -157,7 +181,8 @@ def main(argv: list[str] | None = None) -> int:
                 name, out, cache_dir=args.cache, limit=args.limit,
                 workers=args.workers, delay=args.delay, force=args.force,
                 reparse=args.reparse, obey_robots=not args.no_robots,
-                max_data_size=args.max_data_size,
+                max_data_size=args.max_data_size, strategy=args.strategy,
+                weights=_weights(args.weights),
             )
             print(f"{name}: {counts} -> {out}")
             if counts.get("stopped"):
@@ -265,6 +290,18 @@ def main(argv: list[str] | None = None) -> int:
         from .web import serve
         serve(args.db, args.images, host=args.host, port=args.port,
               max_data_size=parse_size(args.max_data_size))
+        return 0
+
+    if args.cmd == "plan":
+        fetcher = Fetcher(cache_dir=DEFAULT_CACHE, delay=1.0)
+        urls = list(SOURCES[args.source](fetcher).discover(limit=None))
+        summary = plan_summary(urls, _weights(args.weights), args.limit)
+        print(dump(summary) if args.json else format_summary(summary))
+        return 0
+
+    if args.cmd == "coverage":
+        cov = coverage(store.connect(args.db), _weights(args.weights), args.target_total)
+        print(dump(cov) if args.json else format_coverage(cov))
         return 0
 
     if args.cmd == "du":

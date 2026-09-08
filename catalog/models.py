@@ -16,78 +16,14 @@ from typing import Any
 # --------------------------------------------------------------------------
 # design taxonomy
 # --------------------------------------------------------------------------
-# The design AI emits object labels ("3-seater sofa", "pendant light"). Catalog
-# categories are messy and source-specific ("PPC Cement", "Desk plants"). This
-# map is the join between the two: every product gets a `design_category`, and
-# the pricing pass searches within it.
-DESIGN_CATEGORIES: dict[str, tuple[str, ...]] = {
-    "sofa": ("sofa", "settee", "couch", "loveseat", "sectional", "chaise"),
-    "chair": ("chair", "armchair", "stool", "bench", "recliner", "pouffe", "pouf"),
-    "table": ("table", "desk", "console", "nightstand", "bedside"),
-    "bed": ("bed frame", "bed ", "mattress", "headboard", "divan"),
-    "storage": (
-        "wardrobe", "cabinet", "shelf", "shelving", "bookcase", "chest of drawers",
-        "sideboard", "cupboard", "drawer unit", "storage",
-    ),
-    "lighting": (
-        "lamp", "light", "lighting", "cabinet lighting", "luminaire", "chandelier",
-        "pendant", "sconce", "led", "bulb", "downlight", "spotlight", "batten",
-    ),
-    "rug": ("rug", "carpet", "doormat", "mat"),
-    "textile": (
-        "curtain", "cushion", "cushion cover", "throw", "quilt", "duvet", "blanket",
-        "bedsheet", "pillow", "blind",
-    ),
-    "decor": (
-        "vase", "picture", "frame", "mirror", "clock", "candle", "ornament",
-        "plant pot", "artificial plant", "potted plant", "decoration",
-    ),
-    "kitchen": ("kitchen", "worktop", "sink", "cooktop", "chimney", "cookware", "tableware"),
-    "bathroom": (
-        "bathroom", "sanitary", "washbasin", "wash basin", "faucet", "tap", "shower",
-        "toilet", "closet", "cistern", "cp fitting",
-    ),
-    "flooring": ("floor tile", "flooring", "vitrified", "laminate", "wooden floor", "granite", "marble"),
-    "tile": ("tile", "tiling", "adhesive", "grout", "spacer"),
-    "paint": ("paint", "primer", "putty", "emulsion", "enamel", "distemper", "varnish", "wood coat"),
-    "wall_finish": ("wallpaper", "wall panel", "cladding", "texture", "veneer", "laminate sheet"),
-    "ceiling": ("false ceiling", "gypsum", "pop ", "ceiling", "drywall", "grid"),
-    "door_window": ("door", "window", "hinge", "handle", "lock", "shutter", "frame", "glass"),
-    "plumbing": ("pipe", "cpvc", "upvc", "ppr", "plumbing", "valve", "trap", "water tank"),
-    "electrical": (
-        "wire", "cable", "switch", "socket", "mcb", "db box", "conduit", "fan",
-        "electrical", "modular plate",
-    ),
-    "structural": (
-        "cement", "concrete", "steel", "tmt", "brick", "block", "sand", "aggregate",
-        "rebar", "aac", "m sand", "rmc", "waterproofing", "chemical", "plaster",
-    ),
-    "hardware": ("hardware", "screw", "nail", "bolt", "anchor", "fastener", "channel", "bracket"),
-}
+# The design AI emits object labels ("3-seater sofa", "pendant light"). Catalogue
+# categories are messy and source-specific ("PPC Cement", "Desk plants"). The
+# taxonomy module is the join between the two, and is shared with the crawl
+# scheduler so a product is filed the same way whether it is being queued or
+# stored.
+from .taxonomy import INTERIOR_CATEGORIES, classify_text as classify_design_category
 
-_DESIGN_LOOKUP = [(cat, kw) for cat, kws in DESIGN_CATEGORIES.items() for kw in kws]
-
-
-def classify_design_category(*texts: str | None) -> str | None:
-    """Best-effort map from product text to a design taxonomy bucket.
-
-    Pass fields strongest-first (title, then type, then category, then tags): an
-    earlier field outranks a later one, and within a field the longest keyword
-    wins, so "floor tile" beats "tile" and a cement bag filed under a
-    "tiling-bulk-prices" marketing collection still classifies as structural.
-    """
-    fields = [(i, t.lower()) for i, t in enumerate(texts) if t]
-    if not fields:
-        return None
-    best: tuple[int, int, str] | None = None       # (field_rank, -kw_len, cat)
-    for rank, blob in fields:
-        for cat, kw in _DESIGN_LOOKUP:
-            if kw in blob:
-                cand = (rank, -len(kw), cat)
-                if best is None or cand < best:
-                    best = cand
-    return best[2] if best else None
-
+DESIGN_CATEGORIES = {c: kws for c, (_, kws) in INTERIOR_CATEGORIES.items()}
 
 # --------------------------------------------------------------------------
 # dimensions

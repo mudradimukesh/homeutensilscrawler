@@ -16,6 +16,7 @@ from pathlib import Path
 from .budget import DEFAULT_LIMIT, BudgetExceeded, DiskBudget, human, parse_size
 from .http import Fetcher
 from .sources import SOURCES
+from .stratify import format_summary, plan, plan_summary
 
 log = logging.getLogger(__name__)
 
@@ -49,6 +50,8 @@ def scrape(
     cache_max_age: float | None = None,
     budget: DiskBudget | None = None,
     max_data_size: int | str = DEFAULT_LIMIT,
+    strategy: str = "stratified",
+    weights: dict[str, int] | None = None,
 ) -> dict[str, int]:
     if source_name not in SOURCES:
         raise SystemExit(f"unknown source {source_name!r}; have {', '.join(SOURCES)}")
@@ -78,7 +81,16 @@ def scrape(
     if seen:
         log.info("resuming: %d products already in %s", len(seen), out_path.name)
 
-    urls = [u for u in source.discover(limit=limit) if u not in seen]
+    if strategy == "stratified":
+        # Everything must be enumerated before it can be balanced, so the limit
+        # is applied to the *plan*, not to discovery. Sitemaps are cached, so the
+        # enumeration is paid for once rather than per run.
+        discovered = [u for u in source.discover(limit=None) if u not in seen]
+        summary = plan_summary(discovered, weights, limit)
+        log.info("\n%s", format_summary(summary, top=12))
+        urls = plan(discovered, weights, limit)
+    else:
+        urls = [u for u in source.discover(limit=limit) if u not in seen]
     log.info("%s: %d product URLs to fetch", source_name, len(urls))
 
     counts = {"ok": 0, "failed": 0, "skipped": len(seen), "stopped": False}

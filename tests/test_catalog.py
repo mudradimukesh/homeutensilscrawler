@@ -45,8 +45,9 @@ def test_design_category_respects_field_order():
     # A cement bag filed under a "tiling-bulk-prices" collection is still cement.
     assert classify_design_category("Maha PPC Cement, 50 Kg Bag", "PPC Cement", "Cement") == "structural"
     # Longest keyword wins inside one field.
-    assert classify_design_category("YTBERG LED cabinet lighting - white") == "lighting"
+    assert classify_design_category("YTBERG LED cabinet lighting - white") == "ceiling_lighting"
     assert classify_design_category("Somany Vitrified Floor Tile 600x600") == "flooring"
+    assert classify_design_category("VIKHAMMER Bedside table", "bedside table") == "nightstands"
     assert classify_design_category("") is None
 
 
@@ -168,6 +169,91 @@ def test_content_hash_covers_derived_fields():
     assert store._content_hash(a) != store._content_hash(b)
 
 
+# -- taxonomy and crawl stratification -------------------------------------
+def test_slug_classification():
+    from catalog.taxonomy import classify_slug
+    assert classify_slug("vikhammer-bedside-table-white-10339331") == "nightstands"
+    assert classify_slug("zebrasaev-pendant-lamp-white-plastic") == "ceiling_lighting"
+    assert classify_slug("vuku-wardrobe-white") == "wardrobes"
+    assert classify_slug("viskafors-3-seat-sofa-lejde-light-beige") == "sofas"
+
+
+def test_parts_never_outrank_the_furniture_they_belong_to():
+    from catalog.taxonomy import classify_slug
+    # These were the two failures that skewed the first crawl: a spare sofa cover
+    # read as a sofa, and kitchen carcasses read as bedroom storage.
+    assert classify_slug("vimle-cover-for-1-seat-section-gunnared-grey") == "components"
+    assert classify_slug("vimle-cover-4-seat-sofa-w-chaise-longue") == "components"
+    assert classify_slug("voxtorp-drawer-front-oak-effect-40x10-cm") == "components"
+    assert classify_slug("metod-base-cabinet-with-shelves-white") == "components"
+    # ... without swallowing the real products that share those words
+    assert classify_slug("vimle-1-seat-section-gunnared-medium-grey") == "sofas"
+    assert classify_slug("bergpalm-quilt-cover-and-2-pillowcases-grey") == "bedding"
+    assert classify_slug("gurli-cushion-cover-beige") == "bedding"
+
+
+def test_colour_words_are_not_product_types():
+    from catalog.taxonomy import classify_slug
+    # " light " appears in hundreds of colour names; matching it as lighting
+    # would have mis-filed most of the catalogue.
+    assert classify_slug("hemnes-bed-frame-light-grey") == "beds"
+    assert classify_slug("ektorp-sofa-light-beige") == "sofas"
+
+
+def test_coarse_category_filter_beats_the_fine_one():
+    from catalog.taxonomy import expand_category
+    # A design asking for "storage" must still reach a product filed as a
+    # wardrobe, or the pricing pass silently drops the item.
+    assert set(expand_category("storage")) >= {"storage", "wardrobes", "shelving"}
+    assert set(expand_category("lighting")) == {"lamps", "ceiling_lighting"}
+    assert expand_category("beds") == ["beds"]
+    assert expand_category(None) == []
+
+
+def test_family_interleaving_breaks_up_a_range():
+    from catalog.stratify import _interleave_families
+    urls = [f"/p/voxtorp-drawer-front-{i}" for i in range(5)] + [
+        "/p/malm-bed-frame-white", "/p/hemnes-bed-frame-white"]
+    out = _interleave_families(urls)
+    assert out[0].startswith("/p/voxtorp")
+    assert "malm" in out[1] and "hemnes" in out[2], "families must rotate, not run in blocks"
+
+
+def test_plan_is_category_balanced_at_every_prefix(tmp_path="/tmp"):
+    from catalog.stratify import plan
+    from catalog.taxonomy import classify_slug
+    # Mimic sitemap order: a huge block of one family, then a few of everything.
+    urls = [f"https://x/p/voxtorp-drawer-front-{i}-1000000{i}" for i in range(200)]
+    urls += [f"https://x/p/malm-bed-frame-white-200000{i}" for i in range(20)]
+    urls += [f"https://x/p/vidja-floor-lamp-white-300000{i}" for i in range(20)]
+    urls += [f"https://x/p/stockholm-rug-flatwoven-400000{i}" for i in range(20)]
+
+    first30 = plan(urls, limit=30)
+    cats = {classify_slug(u) for u in first30}
+    assert {"beds", "lamps", "rugs"} <= cats, f"early crawl must reach real furniture, got {cats}"
+    # Components are weight 1 against beds at 5, so they must not dominate.
+    n_components = sum(1 for u in first30 if classify_slug(u) == "components")
+    assert n_components <= 6, f"parts took {n_components} of the first 30 slots"
+
+
+def test_plan_respects_weights():
+    from catalog.stratify import plan
+    from catalog.taxonomy import classify_slug
+    urls = [f"https://x/p/malm-bed-frame-{i}-100000{i}" for i in range(50)]
+    urls += [f"https://x/p/lack-coffee-table-{i}-200000{i}" for i in range(50)]
+    heavy_beds = plan(urls, weights={"beds": 10, "tables": 1}, limit=22)
+    n_beds = sum(1 for u in heavy_beds if classify_slug(u) == "beds")
+    assert n_beds == 20, f"a 10:1 weighting should give 20 beds in 22, got {n_beds}"
+
+
+def test_plan_emits_every_url_when_unlimited():
+    from catalog.stratify import plan
+    urls = [f"https://x/p/malm-bed-frame-{i}-10000{i}" for i in range(7)]
+    urls += [f"https://x/p/vidja-floor-lamp-{i}-20000{i}" for i in range(3)]
+    out = plan(urls)
+    assert sorted(out) == sorted(urls), "stratifying must not drop or duplicate URLs"
+
+
 # -- disk budget -----------------------------------------------------------
 def test_parse_size():
     assert parse_size("1GB") == 1024 ** 3
@@ -279,8 +365,8 @@ def _seeded(tmp_path):
         _product("sofa1", 24999.0, "KIVIK 3-seat sofa - grey fabric"),
         _product("sofa2", 89999.0, "LANDSKRONA 3-seat sofa - leather"),
     ])
-    conn.execute("UPDATE products SET design_category='lighting', name='VIP Metal Spot Light Box' "
-                 "WHERE key='test:sofa2'")
+    conn.execute("UPDATE products SET design_category='ceiling_lighting', "
+                 "name='VIP Metal Spot Light Box' WHERE key='test:sofa2'")
     conn.execute("DELETE FROM products_fts WHERE key='test:sofa2'")
     conn.execute("INSERT INTO products_fts (key,name,brand,category_path,description,"
                  "materials,colors,tags) VALUES ('test:sofa2','VIP Metal Spot Light Box','','','','','','')")
@@ -299,7 +385,7 @@ def test_confidence_floor_rejects_a_nonsense_match(tmp_path="/tmp"):
     conn = _seeded(tmp_path)
     quote = price_design(
         conn, [{"label": "brass chandelier with crystal drops",
-                "design_category": "lighting", "quantity": 1}],
+                "design_category": "ceiling_lighting", "quantity": 1}],
         embedder=None,
     )
     line = quote["lines"][0]

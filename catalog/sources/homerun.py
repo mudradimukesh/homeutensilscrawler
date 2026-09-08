@@ -181,7 +181,7 @@ class HomeRun(Source):
     base_url = "https://home-run.co"
 
     def discover(self, limit: int | None = None) -> Iterable[str]:
-        xml = self.fetcher.get(f"{self.base_url}/sitemap.xml", use_cache=False)
+        xml = self.fetcher.get(f"{self.base_url}/sitemap.xml")
         if not xml:
             log.error("could not read HomeRun sitemap")
             return

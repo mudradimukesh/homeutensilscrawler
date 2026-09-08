@@ -87,7 +87,7 @@ class IkeaIndia(Source):
 
     # ---- discovery -------------------------------------------------------
     def discover(self, limit: int | None = None) -> Iterable[str]:
-        index = self.fetcher.get(_SITEMAP_INDEX, use_cache=False)
+        index = self.fetcher.get(_SITEMAP_INDEX)
         if not index:
             log.error("could not read IKEA sitemap index")
             return
@@ -96,7 +96,10 @@ class IkeaIndia(Source):
         seen: set[str] = set()
         n = 0
         for sm in maps:
-            xml = self.fetcher.get(sm, use_cache=False)   # ~50 MB each; not worth caching
+            # ~50 MB each, but a stratified crawl must enumerate the whole
+            # catalogue before it can balance it, so these are cached (they
+            # compress to a fraction) and re-fetched on a refresh's TTL.
+            xml = self.fetcher.get(sm)
             if not xml:
                 continue
             for loc in sitemap_locs(xml):

@@ -1,0 +1,16 @@
+{
+  "room": "Bedroom, 4200mm x 3600mm, Bengaluru — dark teal, under Rs.3 lakh",
+  "objects": [
+    {"label": "double bed frame",  "design_category": "beds",             "quantity": 1},
+    {"label": "mattress",          "design_category": "beds",             "quantity": 1},
+    {"label": "bedside table",     "design_category": "nightstands",      "quantity": 2},
+    {"label": "wardrobe",          "design_category": "wardrobes",        "quantity": 1},
+    {"label": "chest of drawers",  "design_category": "dressers",         "quantity": 1},
+    {"label": "floor lamp",        "design_category": "lamps",            "quantity": 1},
+    {"label": "pendant lamp",      "design_category": "ceiling_lighting", "quantity": 1},
+    {"label": "curtains",          "design_category": "curtains",         "quantity": 2},
+    {"label": "rug",               "design_category": "rugs",             "quantity": 1},
+    {"label": "quilt cover set",   "design_category": "bedding",          "quantity": 1},
+    {"label": "mirror",            "design_category": "mirrors",          "quantity": 1}
+  ]
+}

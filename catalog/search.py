@@ -23,6 +23,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from .embed import Embedder, load_matrix
+from .taxonomy import expand_category
 
 log = logging.getLogger(__name__)
 
@@ -84,8 +85,11 @@ def _filter_sql(
 ) -> tuple[str, list[Any]]:
     clauses, params = ["1=1"], []
     if design_category:
-        clauses.append("design_category = ?")
-        params.append(design_category)
+        # "lighting" must reach lamps and ceiling fittings alike, so a coarse
+        # name expands to the fine categories it covers.
+        fine = expand_category(design_category)
+        clauses.append(f"design_category IN ({','.join('?' * len(fine))})")
+        params += fine
     if min_price is not None:
         clauses.append("price >= ?")
         params.append(min_price)
