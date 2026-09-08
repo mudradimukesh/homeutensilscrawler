@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import store
+from .budget import DEFAULT_LIMIT, DiskBudget, human, parse_size
 from .http import Fetcher
 from .images import download_missing
 from .pipeline import scrape
@@ -113,12 +114,27 @@ def refresh(
     skip_images: bool = False,
     skip_embed: bool = False,
     images_per_product: int = 3,
+    max_data_size: int | str = DEFAULT_LIMIT,
 ) -> dict:
     """Run the full cycle once and return a report."""
     data_dir = Path(data_dir)
     names = sources or sorted(SOURCES)
     started = datetime.now(timezone.utc).isoformat()
     began = time.time()
+
+    # One budget for the whole cycle: crawling, images and the database all draw
+    # on the same allowance, so they have to be counted together.
+    budget = DiskBudget(data_dir, parse_size(max_data_size))
+    if budget.enabled and budget.would_exceed():
+        return {
+            "run_id": None, "started_at": started, "status": "over_budget", "seconds": 0.0,
+            "sources": {}, "products_new": 0, "products_changed": 0,
+            "pages_ok": 0, "pages_failed": 0, "images_downloaded": 0,
+            "embeddings_added": 0, "price_changes": [], "stopped": True,
+            "disk": budget.breakdown(),
+            "error": f"data directory is at {human(budget.used)} of the "
+                     f"{human(budget.limit)} limit; nothing was crawled",
+        }
 
     with Lock(data_dir / "refresh.lock"):
         conn = store.connect(db_path)
@@ -133,6 +149,7 @@ def refresh(
             "run_id": run_id, "started_at": started, "sources": {},
             "products_new": 0, "products_changed": 0, "pages_ok": 0, "pages_failed": 0,
             "images_downloaded": 0, "embeddings_added": 0, "price_changes": [],
+            "stopped": False,
         }
         try:
             for name in names:
@@ -142,32 +159,44 @@ def refresh(
                     workers=workers, delay=delay,
                     # rewrite the file, and treat a page older than stale_after as
                     # needing a re-fetch
-                    reparse=True, cache_max_age=stale_after,
+                    reparse=True, cache_max_age=stale_after, budget=budget,
                 )
                 loaded = store.load_jsonl(conn, out)
+                # Fold the write-ahead log back into the database file so the
+                # directory size reflects the data, not a transient log.
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 report["sources"][name] = {**counts, **loaded}
                 report["pages_ok"] += counts["ok"]
                 report["pages_failed"] += counts["failed"]
                 report["products_new"] += loaded["new"]
                 report["products_changed"] += loaded["changed"]
+                if counts.get("stopped"):
+                    # Whatever was crawled is loaded and consistent; the rest of
+                    # the cycle would only add bytes, so it is skipped.
+                    report["stopped"] = True
+                    break
 
-            if not skip_images:
+            if not skip_images and not report["stopped"]:
                 fetcher = Fetcher(cache_dir=data_dir / "cache", delay=max(delay / 3, 0.2))
                 got = download_missing(
                     conn, fetcher, data_dir / "images",
-                    per_product=images_per_product, workers=workers,
+                    per_product=images_per_product, workers=workers, budget=budget,
                 )
                 report["images"] = got
                 report["images_downloaded"] = got["downloaded"]
+                report["stopped"] = report["stopped"] or got.get("stopped", False)
 
-            if not skip_embed:
+            if not skip_embed and not report["stopped"]:
                 report["embeddings"] = _embed_quietly(conn)
                 report["embeddings_added"] = sum(
                     v for k, v in report["embeddings"].items() if k in ("text", "image")
                 )
 
             report["price_changes"] = _price_changes_since(conn, started)
-            status = "ok"
+            status = "over_budget" if report["stopped"] else "ok"
+            if report["stopped"]:
+                error = (f"stopped at the {human(budget.limit)} data limit; "
+                         f"crawled products were kept")
         except Exception as exc:
             log.exception("refresh failed")
             status, error = "failed", f"{exc.__class__.__name__}: {exc}"
@@ -187,6 +216,7 @@ def refresh(
 
         report["status"] = status
         report["seconds"] = round(time.time() - began, 1)
+        report["disk"] = budget.breakdown()
         return report
 
 
@@ -202,12 +232,23 @@ def _embed_quietly(conn) -> dict:
 
 
 def format_report(r: dict) -> str:
+    label = f"#{r['run_id']}" if r.get("run_id") else "(not started)"
     lines = [
-        f"refresh #{r['run_id']} {r['status']} in {r['seconds']}s",
+        f"refresh {label} {r['status']} in {r['seconds']}s",
         f"  pages   ok={r['pages_ok']} failed={r['pages_failed']}",
         f"  products new={r['products_new']} changed={r['products_changed']}",
         f"  images  +{r['images_downloaded']}   embeddings +{r['embeddings_added']}",
     ]
+    disk = r.get("disk")
+    if disk:
+        lines.append(f"  disk    {disk['used_human']}"
+                     + (f" of {disk['limit_human']} ({disk['percent']}%)"
+                        if disk.get("percent") is not None else ""))
+    if r.get("stopped"):
+        lines.append("  STOPPED at the data limit — the catalogue is consistent, "
+                     "but incomplete.")
+        lines.append("  Free space (data/cache/ is regenerable) or raise "
+                     "--max-data-size, then run refresh again.")
     changes = r.get("price_changes") or []
     if changes:
         lines.append(f"  price changes ({len(changes)}):")

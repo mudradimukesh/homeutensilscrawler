@@ -133,6 +133,36 @@ dead process is reclaimed rather than obeyed, so one crash does not stop tomorro
 Prices are never overwritten in place. Every observed change appends to `price_history`, so
 a quote issued last week can still be explained.
 
+### The disk limit
+
+Every command that writes stops at **1 GB** of `data/` by default. This is a real constraint,
+not a formality: the full catalogue runs to roughly 3.5 GB of images and 2 GB of cached
+pages, so an unattended nightly job would otherwise fill a laptop.
+
+```bash
+python3 -m catalog du                          # what is using the space
+python3 -m catalog refresh --max-data-size 8GB # raise it
+python3 -m catalog refresh --max-data-size 0   # no limit
+```
+
+The limit is enforced *while writing*, not checked afterwards, because a check afterwards is
+just a report of a disk that is already full. Each large writer — the page cache, the image
+store, the JSONL — asks the budget before it writes and stops the run when the next write
+would cross the line. What has been crawled is kept, the database stays consistent, and the
+run is recorded with status `over_budget`, so a nightly job that hits the ceiling shows up in
+`schedule status` and in the web view rather than failing silently.
+
+Writers stop slightly below the ceiling. SQLite extends its write-ahead log on its own
+schedule and cannot be charged per write, so a small reserve keeps the directory genuinely
+under the number you set instead of settling just over it.
+
+Measuring the tree on every write would cost more than the writes, so the total is measured
+once and tracked as bytes are written; the walk is repeated only near the limit, where drift
+would otherwise decide the outcome.
+
+When you hit it, `data/cache/` and `data/thumbs/` are regenerable — deleting them frees space
+without losing any catalogue data.
+
 ## Vector DB or a normal DB?
 
 **Both, in one database: Postgres with `pgvector`. Not a standalone vector store.**
@@ -275,10 +305,11 @@ catalog/
   images.py       content-addressed image downloads
   embed.py        CLIP text and image embeddings
   search.py       hybrid retrieval + design pricing
+  budget.py       the disk ceiling, enforced at every large write
   refresh.py      one scheduled refresh cycle, with a lock and a change report
   schedule.py     launchd agent (systemd/cron equivalents for Linux)
   web.py          read-only JSON API + the browser view, standard library only
   static/         the single-page UI
   postgres.sql    the same schema on Postgres + pgvector
-tests/            18 network-free tests: python3 tests/test_catalog.py
+tests/            25 network-free tests: python3 tests/test_catalog.py
 ```

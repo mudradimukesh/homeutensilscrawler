@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .budget import DEFAULT_LIMIT, DiskBudget
 from .store import connect, stats
 
 log = logging.getLogger(__name__)
@@ -69,9 +70,11 @@ def _fts_match(q: str) -> str | None:
 class Catalog:
     """Thread-local SQLite handles; the stdlib server is threaded."""
 
-    def __init__(self, db_path: str | Path, image_dir: str | Path):
+    def __init__(self, db_path: str | Path, image_dir: str | Path,
+                 max_data_size: int = DEFAULT_LIMIT):
         self.db_path = str(db_path)
         self.image_dir = Path(image_dir)
+        self.budget = DiskBudget(Path(image_dir).parent, max_data_size)
         self.thumb_dir = self.image_dir.parent / "thumbs"
         self._local = threading.local()
 
@@ -107,6 +110,7 @@ class Catalog:
         }
         base["price_observations"] = conn.execute(
             "SELECT COUNT(*) c FROM price_history").fetchone()["c"]
+        base["disk"] = self.budget.breakdown()
         return base
 
     def products(self, qs: dict) -> dict:
@@ -324,13 +328,17 @@ class Handler(BaseHTTPRequestHandler):
         self._send(path.read_bytes(), ctype)
 
 
-def serve(db_path, image_dir, host: str = "127.0.0.1", port: int = 8765) -> None:
-    Handler.catalog = Catalog(db_path, image_dir)
+def serve(db_path, image_dir, host: str = "127.0.0.1", port: int = 8765,
+          max_data_size: int = DEFAULT_LIMIT) -> None:
+    Handler.catalog = Catalog(db_path, image_dir, max_data_size)
     httpd = ThreadingHTTPServer((host, port), Handler)
     summary = Handler.catalog.summary()
     print(f"\n  Interior Catalog  ->  http://{host}:{port}")
     print(f"  {summary['products']} products, {summary['images']} images "
           f"({summary['images_downloaded']} local), {summary['embeddings']} embeddings")
+    disk = summary["disk"]
+    print(f"  disk: {disk['used_human']} of {disk['limit_human']}"
+          + (f" ({disk['percent']}%)" if disk.get("percent") is not None else ""))
     print(f"  SQLite: {db_path}\n  Ctrl-C to stop.\n")
     try:
         httpd.serve_forever()

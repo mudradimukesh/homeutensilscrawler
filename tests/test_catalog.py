@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from catalog import store
+from catalog.budget import BudgetExceeded, DiskBudget, dir_size, human, parse_size
 from catalog.models import (
     Image, Product, Variant, axis_for, classify_design_category,
     parse_length_mm, parse_weight_kg,
@@ -167,6 +168,108 @@ def test_content_hash_covers_derived_fields():
     assert store._content_hash(a) != store._content_hash(b)
 
 
+# -- disk budget -----------------------------------------------------------
+def test_parse_size():
+    assert parse_size("1GB") == 1024 ** 3
+    assert parse_size("750 MB") == 750 * 1024 ** 2
+    assert parse_size("1.5g") == int(1.5 * 1024 ** 3)
+    assert parse_size(2048) == 2048
+    assert parse_size("0") == 0
+    try:
+        parse_size("soon")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("a bad size must be rejected, not guessed at")
+
+
+def test_human_readable():
+    assert human(512) == "512 B"
+    assert human(1024 ** 2) == "1.0 MB"
+    assert human(int(2.5 * 1024 ** 3)) == "2.5 GB"
+
+
+def test_dir_size_survives_unreadable_entries():
+    # A size check must never be the thing that crashes a crawl.
+    assert dir_size(Path("/dev/fd")) >= 0
+    assert dir_size(Path("/definitely/not/here")) == 0
+
+
+def test_budget_stops_before_crossing(tmp_path="/tmp"):
+    root = Path(tmp_path) / "budget_test"
+    if root.exists():
+        for f in root.iterdir():
+            f.unlink()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "a.bin").write_bytes(b"x" * 8000)
+
+    # reserve=0 so the arithmetic under test is the limit itself
+    b = DiskBudget(root, limit=10_000, reserve=0)
+    assert b.used == 8000
+    assert not b.would_exceed(1000)
+    assert b.would_exceed(3000), "a write that crosses the limit must be refused"
+    try:
+        b.check(3000)
+    except BudgetExceeded as exc:
+        assert "10.0 KB" in str(exc) or "9.8 KB" in str(exc)
+    else:
+        raise AssertionError("check() must raise once the limit would be crossed")
+
+    (root / "b.bin").write_bytes(b"x" * 1500)
+    assert b.resync() == 9500, "resync must see files written outside the budget"
+    for f in root.iterdir():
+        f.unlink()
+    root.rmdir()
+
+
+def test_budget_reserve_keeps_the_directory_under_the_limit(tmp_path="/tmp"):
+    # Writers stop short of the ceiling, so uncharged growth (SQLite's WAL) does
+    # not settle the directory just over the number the user asked for.
+    b = DiskBudget(Path(tmp_path), limit=1024 ** 3)
+    assert b.reserve > 0
+    assert b.ceiling < b.limit
+    assert b.reserve == min(int(1024 ** 3 * 0.02), 32 * 1024 ** 2)
+
+
+def test_budget_disabled_when_zero(tmp_path="/tmp"):
+    b = DiskBudget(Path(tmp_path), limit=0)
+    assert not b.enabled
+    assert not b.would_exceed(10 ** 12)
+    b.check(10 ** 12)                     # must not raise
+
+
+def test_image_download_stops_at_the_budget(tmp_path="/tmp"):
+    from catalog.images import download_missing
+
+    db = Path(tmp_path) / "budget_images.db"
+    db.unlink(missing_ok=True)
+    conn = store.connect(db)
+    p = _product()
+    p.images = [Image(url=f"https://img.test/{i}.jpg", position=i) for i in range(10)]
+    store.upsert(conn, [p])
+
+    images = Path(tmp_path) / "budget_images"
+    if images.exists():
+        for child in sorted(images.rglob("*"), reverse=True):
+            child.unlink() if child.is_file() else child.rmdir()
+
+    class StubFetcher:
+        """Distinct 4 KB payloads. Identical bytes would deduplicate to one file
+        and the directory would never grow, so the test would pass vacuously."""
+        def get_bytes(self, url):
+            body = url.encode()
+            return body + b"\x00" * (4096 - len(body))
+
+    start = dir_size(images) if images.exists() else 0
+    budget = DiskBudget(images, limit=start + 12_000, reserve=0)
+    got = download_missing(conn, StubFetcher(), images, budget=budget, workers=1)
+
+    assert got["stopped"] is True, "the download must stop, not run to completion"
+    assert 0 < got["downloaded"] < 10
+    assert dir_size(images) <= budget.limit
+    db.unlink(missing_ok=True)
+
+
 # -- search and pricing ----------------------------------------------------
 def _seeded(tmp_path):
     db = Path(tmp_path) / "search.db"
@@ -209,7 +312,9 @@ def test_web_search_uses_fts_without_an_alias(tmp_path="/tmp"):
     # FTS5 resolves MATCH and bm25() against the table name; an alias raises
     # "no such column", which the browser only saw as an empty result.
     conn = _seeded(tmp_path)
-    web = Catalog(Path(tmp_path) / "search.db", Path(tmp_path))
+    holder = Path(tmp_path) / "web_data" / "images"
+    holder.mkdir(parents=True, exist_ok=True)
+    web = Catalog(Path(tmp_path) / "search.db", holder)
     web._local.conn = conn
     out = web.products({"q": ["sofa grey"]})
     assert out["total"] >= 1

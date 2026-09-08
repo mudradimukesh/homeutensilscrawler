@@ -6,6 +6,7 @@ import re
 from abc import ABC, abstractmethod
 from typing import Iterable
 
+from ..budget import BudgetExceeded
 from ..http import Fetcher
 from ..models import Product
 
@@ -45,6 +46,8 @@ class Source(ABC):
             return None
         try:
             return self.parse(url, html)
+        except BudgetExceeded:
+            raise                       # a stop signal, not a bad page
         except Exception:
             log.exception("parse failed: %s", url)
             return None

@@ -12,6 +12,7 @@ from .embed import DEFAULT_MODEL, DEFAULT_PRETRAINED, Embedder, embed_catalog
 from .http import Fetcher
 from .images import download_missing
 from .pipeline import scrape
+from .budget import DEFAULT_LIMIT, DiskBudget, parse_size, report as disk_report
 from .search import dump, find_products, price_design
 from .sources import SOURCES
 
@@ -45,6 +46,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--reparse", action="store_true",
                    help="rebuild the JSONL from cached pages after a parser change (no requests)")
     p.add_argument("--no-robots", action="store_true", help="skip robots.txt checks")
+    p.add_argument("--max-data-size", default="1GB",
+                   help="stop when data/ reaches this size (default 1GB; 0 = no limit)")
+
 
     p = sub.add_parser("load", help="load JSONL into the database")
     p.add_argument("files", nargs="*", help="default: every data/*.jsonl")
@@ -55,6 +59,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--delay", type=float, default=0.3)
     p.add_argument("--dir", default=str(DEFAULT_IMAGES))
+    p.add_argument("--max-data-size", default="1GB",
+                   help="stop when data/ reaches this size (default 1GB; 0 = no limit)")
+
 
     p = sub.add_parser("embed", help="compute CLIP embeddings")
     p.add_argument("--text-only", action="store_true")
@@ -98,6 +105,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--skip-images", action="store_true")
     p.add_argument("--skip-embed", action="store_true")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--max-data-size", default="1GB",
+                   help="stop when data/ reaches this size (default 1GB; 0 = no limit)")
 
     p = sub.add_parser("watch", help="run refresh on a loop (containers; prefer `schedule` on macOS)")
     p.add_argument("--every", default="24h")
@@ -108,11 +117,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--limit", type=int)
     p.add_argument("--skip-images", action="store_true")
     p.add_argument("--skip-embed", action="store_true")
+    p.add_argument("--max-data-size", default="1GB",
+                   help="stop when data/ reaches this size (default 1GB; 0 = no limit)")
 
     p = sub.add_parser("schedule", help="install the refresh as a daily background job")
     p.add_argument("action", choices=["install", "uninstall", "status"])
     p.add_argument("--at", default="03:30", help="local time of day, HH:MM")
     p.add_argument("--stale-after", default="0")
+    p.add_argument("--max-data-size", default="1GB")
     p.add_argument("--skip-embed", action="store_true")
     p.add_argument("--print-only", action="store_true",
                    help="print the job definition instead of installing it")
@@ -121,6 +133,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--images", default=str(DEFAULT_IMAGES))
+    p.add_argument("--max-data-size", default="1GB")
+
+    p = sub.add_parser("du", help="how much disk the catalogue is using")
+    p.add_argument("--max-data-size", default="1GB")
+    p.add_argument("--json", action="store_true")
 
     sub.add_parser("stats", help="what is in the database")
 
@@ -140,8 +157,13 @@ def main(argv: list[str] | None = None) -> int:
                 name, out, cache_dir=args.cache, limit=args.limit,
                 workers=args.workers, delay=args.delay, force=args.force,
                 reparse=args.reparse, obey_robots=not args.no_robots,
+                max_data_size=args.max_data_size,
             )
             print(f"{name}: {counts} -> {out}")
+            if counts.get("stopped"):
+                print(f"  stopped at the {args.max_data_size} data limit; "
+                      f"run `python3 -m catalog du` to see what is using it")
+                return 2
         return 0
 
     if args.cmd == "load":
@@ -157,12 +179,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "images":
         conn = store.connect(args.db)
-        fetcher = Fetcher(cache_dir=DEFAULT_CACHE, delay=args.delay)
-        print(dump(download_missing(
+        budget = DiskBudget(DATA, parse_size(args.max_data_size))
+        fetcher = Fetcher(cache_dir=DEFAULT_CACHE, delay=args.delay, budget=budget)
+        got = download_missing(
             conn, fetcher, args.dir, limit=args.limit,
-            per_product=args.per_product, workers=args.workers,
-        )))
-        return 0
+            per_product=args.per_product, workers=args.workers, budget=budget,
+        )
+        print(dump(got))
+        print(disk_report(budget.breakdown()))
+        return 2 if got.get("stopped") else 0
 
     if args.cmd == "embed":
         conn = store.connect(args.db)
@@ -213,13 +238,14 @@ def main(argv: list[str] | None = None) -> int:
             stale_after=parse_duration(args.stale_after), delay=args.delay,
             workers=args.workers, limit=args.limit,
             skip_images=args.skip_images, skip_embed=args.skip_embed,
+            max_data_size=args.max_data_size,
         )
         if args.cmd == "watch":
             watch(parse_duration(args.every), **opts)
             return 0
-        report = refresh(**opts)
-        print(dump(report) if args.json else format_report(report))
-        return 0 if report["status"] == "ok" else 1
+        rep = refresh(**opts)
+        print(dump(rep) if args.json else format_report(rep))
+        return 0 if rep["status"] == "ok" else (2 if rep["status"] == "over_budget" else 1)
 
     if args.cmd == "schedule":
         from . import schedule as sched
@@ -228,7 +254,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.action == "status":
             return sched.status(args.db)
         hour, _, minute = args.at.partition(":")
-        extra = ["--stale-after", args.stale_after]
+        extra = ["--stale-after", args.stale_after,
+                 "--max-data-size", args.max_data_size]
         if args.skip_embed:
             extra.append("--skip-embed")
         return sched.install(ROOT, int(hour), int(minute or 0), extra,
@@ -236,8 +263,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "web":
         from .web import serve
-        serve(args.db, args.images, host=args.host, port=args.port)
+        serve(args.db, args.images, host=args.host, port=args.port,
+              max_data_size=parse_size(args.max_data_size))
         return 0
+
+    if args.cmd == "du":
+        budget = DiskBudget(DATA, parse_size(args.max_data_size))
+        breakdown = budget.breakdown()
+        print(dump(breakdown) if args.json else disk_report(breakdown))
+        return 2 if budget.enabled and breakdown["used"] > budget.limit else 0
 
     if args.cmd == "stats":
         print(dump(store.stats(store.connect(args.db))))

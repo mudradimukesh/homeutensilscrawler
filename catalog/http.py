@@ -78,11 +78,13 @@ class Fetcher:
         obey_robots: bool = True,
         max_retries: int = 3,
         cache_max_age: float | None = None,
+        budget=None,
     ):
         self.cache_dir = Path(cache_dir)
         # None = a cached page never expires (good while writing a parser);
         # 0 = always refetch (what a scheduled refresh wants).
         self.cache_max_age = cache_max_age
+        self.budget = budget            # a DiskBudget, or None for no ceiling
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.limiter = RateLimiter(delay)
         self.timeout = timeout
@@ -154,9 +156,14 @@ class Fetcher:
         return None
 
     def _store(self, url: str, body: str) -> None:
+        blob = gzip.compress(body.encode("utf-8"), 6)
+        if self.budget is not None:
+            self.budget.check(len(blob))        # raises BudgetExceeded
         p = self._cache_path(url)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(gzip.compress(body.encode("utf-8"), 6))
+        p.write_bytes(blob)
+        if self.budget is not None:
+            self.budget.add(len(blob))
 
     # -- fetch -------------------------------------------------------------
     def get(self, url: str, *, use_cache: bool = True, force: bool = False) -> str | None:

@@ -9,10 +9,12 @@ from __future__ import annotations
 import hashlib
 import logging
 import sqlite3
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
+from .budget import DiskBudget, human
 from .http import Fetcher
 
 log = logging.getLogger(__name__)
@@ -40,6 +42,7 @@ def download_missing(
     limit: int | None = None,
     per_product: int | None = None,
     workers: int = 4,
+    budget: DiskBudget | None = None,
 ) -> dict[str, int]:
     """Fetch every image row that has no local file yet.
 
@@ -58,9 +61,12 @@ def download_missing(
     rows = conn.execute(sql).fetchall()
     log.info("images to download: %d", len(rows))
 
-    counts = {"downloaded": 0, "deduped": 0, "failed": 0}
+    counts = {"downloaded": 0, "deduped": 0, "failed": 0, "stopped": False}
+    stop = threading.Event()
 
     def work(row):
+        if stop.is_set():
+            return row, None, "stopped"
         blob = fetcher.get_bytes(row["url"])
         if not blob:
             return row, None, None
@@ -68,12 +74,22 @@ def download_missing(
         path = image_dir / digest[:2] / f"{digest}{_extension(row['url'], blob)}"
         existed = path.exists()
         if not existed:
+            # A duplicate costs nothing new on disk, so only a genuinely new file
+            # is charged to the budget — and it is charged before it is written.
+            if budget is not None and budget.would_exceed(len(blob)):
+                stop.set()
+                return row, None, "stopped"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(blob)
+            if budget is not None:
+                budget.add(len(blob))
         return row, path, (digest, existed)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for row, path, meta in pool.map(work, rows):
+            if meta == "stopped":
+                counts["stopped"] = True
+                continue
             if path is None:
                 counts["failed"] += 1
                 continue
@@ -85,4 +101,8 @@ def download_missing(
                 (str(path), digest, row["product_key"], row["position"]),
             )
     conn.commit()
+    if counts["stopped"] and budget is not None:
+        log.warning("image download stopped at %s of %s; %d images still pending",
+                    human(budget.used), human(budget.limit),
+                    len(rows) - counts["downloaded"] - counts["deduped"] - counts["failed"])
     return counts
