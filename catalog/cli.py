@@ -163,6 +163,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--weights")
     p.add_argument("--json", action="store_true")
 
+    p = sub.add_parser("design", help="ask a model to design a room from the catalogue")
+    p.add_argument("prompt")
+    p.add_argument("--model", default="gpt-5-mini")
+    p.add_argument("--max-turns", type=int, default=10)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--quiet", action="store_true", help="do not print tool calls as they run")
+
+    p = sub.add_parser("tool-schemas", help="print the tool definitions given to the model")
+
     p = sub.add_parser("family", help="every SKU in a model line — the variant lookup")
     p.add_argument("key", help="a family_key, or a product key to look up its family")
     p.add_argument("--json", action="store_true")
@@ -330,6 +339,45 @@ def main(argv: list[str] | None = None) -> int:
                 entry.update(families=r["f"], eligible=r["e"] or 0,
                              placeable_families=r["ef"] or 0, sources=r["s"])
         print(dump(cov) if args.json else format_coverage(cov))
+        return 0
+
+    if args.cmd == "tool-schemas":
+        from .tools import TOOL_SCHEMAS
+        print(dump(TOOL_SCHEMAS))
+        return 0
+
+    if args.cmd == "design":
+        from .agent import AgentError, run
+        from .tools import CatalogService
+        service = CatalogService(args.db)
+        try:
+            result = run(args.prompt, service, model=args.model,
+                         max_turns=args.max_turns, verbose=not args.quiet)
+        except AgentError as exc:
+            print(f"design failed: {exc}", file=sys.stderr)
+            return 1
+        if args.json:
+            print(dump(result))
+            return 0
+        print("\n" + result["reply"] + "\n")
+        bom = result["priced_design"]
+        if bom:
+            print(f"{'—' * 78}")
+            for line in bom["lines"]:
+                total = line.get("line_total")
+                money = f"Rs.{total:,.0f}" if total is not None else "—"
+                flag = "" if line.get("placeable", True) else "  (not placeable)"
+                print(f"  {str(line.get('label'))[:26]:<26} x{line.get('quantity', 1):<4g} "
+                      f"{str(line.get('name', ''))[:38]:<38} {money:>11}{flag}")
+            print(f"  {'TOTAL':<26} {'':<5} {'':<38} Rs.{bom['subtotal']:>8,.0f}")
+            stale = bom.get("subtotal_by_price_state", {}).get("stale", 0)
+            if stale:
+                print(f"  Rs.{stale:,.0f} of that rests on prices not seen recently.")
+            if bom.get("rejected_items"):
+                print(f"  {len(bom['rejected_items'])} item(s) rejected: "
+                      f"product keys the catalogue never issued.")
+        print(f"\n  {result['turns']} turns · {len(result['tool_calls'])} tool calls · "
+              f"{result['tokens']['input']:,} in / {result['tokens']['output']:,} out tokens")
         return 0
 
     if args.cmd == "family":

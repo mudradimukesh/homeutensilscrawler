@@ -256,6 +256,202 @@ def test_plan_emits_every_url_when_unlimited():
     assert sorted(out) == sorted(urls), "stratifying must not drop or duplicate URLs"
 
 
+# -- search index consistency ----------------------------------------------
+def test_fts_follows_products_through_every_write(tmp_path="/tmp"):
+    db = Path(tmp_path) / "fts_triggers.db"
+    db.unlink(missing_ok=True)
+    conn = store.connect(db)
+
+    p = _product("f1", 1000.0, "MALM Bed frame white")
+    store.upsert(conn, [p])
+    assert store.fts_drift(conn) == {"missing": 0, "orphaned": 0, "stale": 0}
+
+    p.name = "MALM Bed frame black"
+    p.price = 1100.0
+    store.upsert(conn, [p])
+    assert store.fts_drift(conn)["stale"] == 0
+    assert conn.execute("SELECT name FROM products_fts").fetchone()["name"] == p.name
+
+    # A delete had no application path at all before the triggers, so an orphan
+    # would have survived in the index indefinitely.
+    conn.execute("DELETE FROM products WHERE key = ?", (p.key,))
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) c FROM products_fts").fetchone()["c"] == 0
+    db.unlink(missing_ok=True)
+
+
+def test_fts_follows_a_write_that_bypasses_application_code(tmp_path="/tmp"):
+    db = Path(tmp_path) / "fts_raw.db"
+    db.unlink(missing_ok=True)
+    conn = store.connect(db)
+    store.upsert(conn, [_product("f2", 500.0, "HEMNES Chest")])
+    # The whole point of moving this into the database: a migration, a fix-up
+    # script or a psql session cannot desynchronise the index.
+    conn.execute("UPDATE products SET name = 'HEMNES Chest of 3 drawers'")
+    conn.commit()
+    assert store.fts_drift(conn) == {"missing": 0, "orphaned": 0, "stale": 0}
+    assert "3 drawers" in conn.execute("SELECT name FROM products_fts").fetchone()["name"]
+    db.unlink(missing_ok=True)
+
+
+def test_rebuild_fts_restores_an_index_damaged_out_of_band(tmp_path="/tmp"):
+    db = Path(tmp_path) / "fts_rebuild.db"
+    db.unlink(missing_ok=True)
+    conn = store.connect(db)
+    store.upsert(conn, [_product("f3", 100.0, "VIDJA Floor lamp")])
+    conn.execute("DELETE FROM products_fts")          # simulate damage
+    conn.commit()
+    assert store.fts_drift(conn)["missing"] == 1
+    assert store.rebuild_fts(conn) == 1
+    assert store.fts_drift(conn) == {"missing": 0, "orphaned": 0, "stale": 0}
+    db.unlink(missing_ok=True)
+
+
+# -- tool boundary ---------------------------------------------------------
+def _service(tmp_path, name="tools.db"):
+    from catalog.tools import CatalogService
+    db = Path(tmp_path) / name
+    db.unlink(missing_ok=True)
+    conn = store.connect(db)
+    bed = _ikea("MALM Bed frame - white 160x200 cm", "MALM", "bed frame")
+    bed.design_category = "beds"
+    bed.dimensions = {"width_mm": 1600.0, "length_mm": 2000.0}
+    lamp = _ikea("VIDJA Floor lamp - white", "VIDJA", "floor lamp")
+    lamp.design_category, lamp.price = "lamps", 3990.0
+    lamp.dimensions = {"height_mm": 1380.0, "diameter_mm": 250.0}
+    store.upsert(conn, [bed, lamp])
+    svc = CatalogService(db)
+    svc.conn = conn
+    return svc
+
+
+def test_tools_never_leak_internals(tmp_path="/tmp"):
+    svc = _service(tmp_path, "leak.db")
+    card = svc.search_catalog(query="bed frame", limit=1)["results"][0]
+    detail = svc.get_product(card["product_key"])
+    blob = json.dumps([card, detail])
+    # A prompt is not the place for local paths, raw payloads or internal columns.
+    for forbidden in ("local_path", "/Users/", "content_hash", "embedding_text",
+                      "raw", "quality_gaps\": null"):
+        assert forbidden not in blob, f"{forbidden!r} reached the model"
+    assert card["product_key"].startswith("ikea_in:")
+
+
+def test_a_design_cannot_use_a_key_the_catalog_never_issued(tmp_path="/tmp"):
+    svc = _service(tmp_path, "ledger.db")
+    real = svc.search_catalog(query="bed frame", limit=1)["results"][0]["product_key"]
+    quote = svc.price_design([
+        {"product_key": real, "label": "bed", "quantity": 1},
+        {"product_key": "ikea_in:00000000", "label": "brass chandelier", "quantity": 1},
+    ])
+    assert len(quote["rejected_items"]) == 1
+    assert quote["rejected_items"][0]["product_key"] == "ikea_in:00000000"
+    # ... and the fabricated line contributes nothing to the total
+    assert quote["subtotal"] == 12990.0
+    assert all(line["product_key"] != "ikea_in:00000000" for line in quote["lines"])
+
+
+def test_dimension_limits_are_hard(tmp_path="/tmp"):
+    svc = _service(tmp_path, "dims.db")
+    assert svc.search_catalog(query="bed frame", max_width_mm=2000)["count"] == 1
+    # A bed wider than the wall is a wrong answer, not a lower-ranked one.
+    assert svc.search_catalog(query="bed frame", max_width_mm=900)["count"] == 0
+
+
+def test_unknown_tool_is_an_error_not_a_silent_noop(tmp_path="/tmp"):
+    from catalog.tools import dispatch
+    svc = _service(tmp_path, "dispatch.db")
+    assert "error" in dispatch(svc, "delete_everything", {})
+
+
+# -- agent loop ------------------------------------------------------------
+def test_agent_runs_a_tool_loop_and_returns_the_bom(tmp_path="/tmp"):
+    """Exercises the Responses API protocol against a stubbed transport."""
+    from catalog import agent as agent_mod
+
+    svc = _service(tmp_path, "agent.db")
+    key = svc.search_catalog(query="bed frame", limit=1)["results"][0]["product_key"]
+    scripted = [
+        {"output": [{"type": "function_call", "call_id": "c1", "name": "search_catalog",
+                     "arguments": json.dumps({"query": "bed frame", "limit": 1})}],
+         "usage": {"input_tokens": 10, "output_tokens": 5}},
+        {"output": [{"type": "function_call", "call_id": "c2", "name": "price_design",
+                     "arguments": json.dumps({"objects": [
+                         {"product_key": key, "label": "bed", "quantity": 1}]})}],
+         "usage": {"input_tokens": 20, "output_tokens": 8}},
+        {"output": [{"type": "message", "content": [
+            {"type": "output_text", "text": "A calm room built around the MALM bed."}]}],
+         "usage": {"input_tokens": 30, "output_tokens": 12}},
+    ]
+    sent = []
+
+    def fake_post(payload, api_key, timeout=180):
+        sent.append(payload)
+        return scripted[len(sent) - 1]
+
+    original = agent_mod._post
+    agent_mod._post = fake_post
+    try:
+        out = agent_mod.run("design a bedroom", svc, api_key="test-key")
+    finally:
+        agent_mod._post = original
+
+    assert out["priced_design"]["subtotal"] == 12990.0
+    assert [c["tool"] for c in out["tool_calls"]] == ["search_catalog", "price_design"]
+    assert "MALM" in out["reply"]
+    assert out["tokens"] == {"input": 60, "output": 25}
+    # Each tool result must be returned against the call it answers.
+    outputs = [i for i in sent[-1]["input"] if i.get("type") == "function_call_output"]
+    assert [o["call_id"] for o in outputs] == ["c1", "c2"]
+
+
+def test_agent_hands_bad_arguments_back_to_the_model(tmp_path="/tmp"):
+    from catalog import agent as agent_mod
+    svc = _service(tmp_path, "agent_args.db")
+    scripted = [
+        {"output": [{"type": "function_call", "call_id": "c1", "name": "search_catalog",
+                     "arguments": '{"nonsense_field": 1}'}]},
+        {"output": [{"type": "message",
+                     "content": [{"type": "output_text", "text": "retrying"}]}]},
+    ]
+    sent = []
+    agent_mod._post, original = (lambda p, api_key, timeout=180:
+                                 (sent.append(p), scripted[len(sent) - 1])[1]), agent_mod._post
+    try:
+        agent_mod.run("x", svc, api_key="k")
+    finally:
+        agent_mod._post = original
+    result = json.loads([i for i in sent[-1]["input"]
+                         if i.get("type") == "function_call_output"][0]["output"])
+    # A wrong argument name is the model's to correct, not a crash.
+    assert "error" in result and "bad arguments" in result["error"]
+
+
+def test_billing_failure_is_not_retried():
+    from catalog import agent as agent_mod
+
+    class Resp:
+        status_code = 429
+        text = ""
+        headers: dict = {}
+        def json(self):
+            return {"error": {"message": "You have no credits remaining."}}
+
+    calls = []
+    original = agent_mod.requests.post
+    agent_mod.requests.post = lambda *a, **k: (calls.append(1), Resp())[1]
+    try:
+        try:
+            agent_mod._post({}, "k")
+        except agent_mod.AgentError as exc:
+            assert "no credits" in str(exc).lower()
+        else:
+            raise AssertionError("a billing failure must raise")
+    finally:
+        agent_mod.requests.post = original
+    assert len(calls) == 1, "backing off on an empty balance just wastes time"
+
+
 # -- product families ------------------------------------------------------
 def _slug_id(name):
     # Full slug: truncating collided 140/160/180 onto one key and silently

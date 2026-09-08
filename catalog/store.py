@@ -191,6 +191,35 @@ CREATE VIRTUAL TABLE IF NOT EXISTS products_fts USING fts5(
     key UNINDEXED, name, brand, category_path, description, materials, colors, tags,
     tokenize='porter unicode61'
 );
+
+-- The index is maintained by the database, not by application code. Keeping the
+-- two in step by convention works right up until the first code path that
+-- forgets, and a search index that disagrees with the table it describes is an
+-- exceptionally confusing bug to chase. Triggers make it structural: any write
+-- to products, from anywhere, carries the index with it inside the same
+-- transaction.
+CREATE TRIGGER IF NOT EXISTS products_fts_ai AFTER INSERT ON products BEGIN
+    INSERT INTO products_fts (key, name, brand, category_path, description,
+                              materials, colors, tags)
+    VALUES (new.key, COALESCE(new.name, ''), COALESCE(new.brand, ''),
+            COALESCE(new.category_path, ''), COALESCE(new.description, ''),
+            COALESCE(new.materials, ''), COALESCE(new.colors, ''),
+            COALESCE(new.tags, ''));
+END;
+
+CREATE TRIGGER IF NOT EXISTS products_fts_ad AFTER DELETE ON products BEGIN
+    DELETE FROM products_fts WHERE key = old.key;
+END;
+
+CREATE TRIGGER IF NOT EXISTS products_fts_au AFTER UPDATE ON products BEGIN
+    DELETE FROM products_fts WHERE key = old.key;
+    INSERT INTO products_fts (key, name, brand, category_path, description,
+                              materials, colors, tags)
+    VALUES (new.key, COALESCE(new.name, ''), COALESCE(new.brand, ''),
+            COALESCE(new.category_path, ''), COALESCE(new.description, ''),
+            COALESCE(new.materials, ''), COALESCE(new.colors, ''),
+            COALESCE(new.tags, ''));
+END;
 """
 
 _PRODUCT_COLS = [
@@ -224,6 +253,32 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn.executescript(SCHEMA)
     _migrate(conn)
     return conn
+
+
+def fts_drift(conn: sqlite3.Connection) -> dict[str, int]:
+    """How far the search index has drifted from the table. Should always be zero."""
+    q = lambda sql: conn.execute(sql).fetchone()[0]      # noqa: E731
+    return {
+        "missing": q("SELECT COUNT(*) FROM products p WHERE NOT EXISTS "
+                     "(SELECT 1 FROM products_fts f WHERE f.key = p.key)"),
+        "orphaned": q("SELECT COUNT(*) FROM products_fts f WHERE NOT EXISTS "
+                      "(SELECT 1 FROM products p WHERE p.key = f.key)"),
+        "stale": q("SELECT COUNT(*) FROM products p JOIN products_fts f ON f.key = p.key "
+                   "WHERE f.name <> COALESCE(p.name, '')"),
+    }
+
+
+def rebuild_fts(conn: sqlite3.Connection) -> int:
+    """Rebuild the index from the table. Only needed after an out-of-band change."""
+    conn.execute("DELETE FROM products_fts")
+    conn.execute(
+        "INSERT INTO products_fts (key, name, brand, category_path, description, "
+        "materials, colors, tags) SELECT key, COALESCE(name,''), COALESCE(brand,''), "
+        "COALESCE(category_path,''), COALESCE(description,''), COALESCE(materials,''), "
+        "COALESCE(colors,''), COALESCE(tags,'') FROM products"
+    )
+    conn.commit()
+    return conn.execute("SELECT COUNT(*) FROM products_fts").fetchone()[0]
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -381,15 +436,6 @@ def upsert(conn: sqlite3.Connection, products: Iterable[Product]) -> dict[str, i
                 (p.key, now, p.price, p.availability),
             )
 
-        conn.execute("DELETE FROM products_fts WHERE key=?", (p.key,))
-        conn.execute(
-            "INSERT INTO products_fts (key,name,brand,category_path,description,"
-            "materials,colors,tags) VALUES (?,?,?,?,?,?,?,?)",
-            (p.key, p.name, p.brand or "", " ".join(p.category_path),
-             (p.description or "")[:4000], " ".join(p.materials),
-             " ".join(p.colors), " ".join(p.tags)),
-        )
-
     conn.commit()
     return stats
 
@@ -436,6 +482,7 @@ def stats(conn: sqlite3.Connection) -> dict[str, Any]:
             "GROUP BY design_category ORDER BY c DESC")},
         "priced": conn.execute(
             "SELECT COUNT(*) c FROM products WHERE price IS NOT NULL").fetchone()["c"],
+        "fts_drift": fts_drift(conn),
         "last_run": (lambda r: dict(r) if r else None)(conn.execute(
             "SELECT source, started_at, finished_at, status, products_new, "
             "products_changed, price_changes FROM crawl_runs "
