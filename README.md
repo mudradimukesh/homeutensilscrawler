@@ -16,6 +16,9 @@ browser and no DOM scraping: HomeRun ships its Shopify product object in the Rea
 Server Components payload, IKEA ships `text/hydrate` JSON. That is why a full page
 parse costs about a millisecond and why the parsers survive theme changes.
 
+[**Design spec**](docs/DESIGN.md) — the data model, the crawl-ordering and completeness
+decisions with the measurements behind them, the model tool boundary, and the open items.
+
 ## Quickstart
 
 ```bash
