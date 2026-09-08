@@ -1,0 +1,12 @@
+{
+  "room": "Living room, 12x14 ft, Bengaluru",
+  "objects": [
+    {"label": "pendant lamp", "design_category": "lighting", "quantity": 1, "color": "white"},
+    {"label": "wardrobe",     "design_category": "storage",  "quantity": 1, "color": "white", "max_price": 20000},
+    {"label": "floor tile 600x600", "design_category": "flooring", "quantity": 47, "notes": "vitrified, light grey"},
+    {"label": "interior wall primer", "design_category": "paint", "quantity": 2},
+    {"label": "wall putty", "design_category": "paint", "quantity": 3},
+    {"label": "cement for plastering", "design_category": "structural", "quantity": 12},
+    {"label": "brass chandelier with crystal drops", "design_category": "lighting", "quantity": 1, "max_price": 3000}
+  ]
+}

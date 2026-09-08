@@ -1,0 +1,301 @@
+"""SQLite catalog store: products, variants, images, price history, embeddings.
+
+SQLite is the default because the whole catalogue is ~13k products — small enough
+that a single file with an FTS5 index and brute-force cosine over embeddings
+answers in milliseconds, with no server to run. `catalog/postgres.sql` holds the
+same schema for Postgres + pgvector, which is where this should move once the
+catalogue is shared by more than one process. Nothing above this module knows
+which one is underneath.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+from .models import Product
+
+log = logging.getLogger(__name__)
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+
+CREATE TABLE IF NOT EXISTS products (
+    key              TEXT PRIMARY KEY,          -- '<source>:<source_id>'
+    source           TEXT NOT NULL,
+    source_id        TEXT NOT NULL,
+    url              TEXT NOT NULL,
+    name             TEXT NOT NULL,
+    brand            TEXT,
+    product_type     TEXT,
+    category         TEXT,
+    category_path    TEXT,                      -- JSON array
+    design_category  TEXT,
+    description      TEXT,
+    description_html TEXT,
+    price            REAL,
+    compare_at_price REAL,
+    currency         TEXT DEFAULT 'INR',
+    price_unit       TEXT,
+    availability     TEXT DEFAULT 'unknown',
+    sku              TEXT,
+    item_no          TEXT,
+    width_mm         REAL,
+    height_mm        REAL,
+    depth_mm         REAL,
+    length_mm        REAL,
+    diameter_mm      REAL,
+    dimensions       TEXT,                      -- JSON object, all axes
+    dimension_text   TEXT,                      -- JSON array
+    weight_kg        REAL,
+    materials        TEXT,
+    colors           TEXT,
+    tags             TEXT,
+    rating           REAL,
+    review_count     INTEGER,
+    country          TEXT DEFAULT 'IN',
+    attributes       TEXT,
+    raw              TEXT,
+    embedding_text   TEXT,
+    content_hash     TEXT,
+    first_seen       TEXT,
+    last_seen        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_products_design  ON products(design_category);
+CREATE INDEX IF NOT EXISTS idx_products_source  ON products(source);
+CREATE INDEX IF NOT EXISTS idx_products_price   ON products(price);
+CREATE INDEX IF NOT EXISTS idx_products_avail   ON products(availability);
+
+CREATE TABLE IF NOT EXISTS product_images (
+    product_key TEXT NOT NULL REFERENCES products(key) ON DELETE CASCADE,
+    position    INTEGER NOT NULL,
+    url         TEXT NOT NULL,
+    alt         TEXT,
+    width       INTEGER,
+    height      INTEGER,
+    role        TEXT,
+    local_path  TEXT,
+    sha256      TEXT,
+    PRIMARY KEY (product_key, position)
+);
+CREATE INDEX IF NOT EXISTS idx_images_sha ON product_images(sha256);
+
+CREATE TABLE IF NOT EXISTS product_variants (
+    product_key      TEXT NOT NULL REFERENCES products(key) ON DELETE CASCADE,
+    variant_id       TEXT NOT NULL,
+    title            TEXT,
+    sku              TEXT,
+    price            REAL,
+    compare_at_price REAL,
+    available        INTEGER,
+    quantity         INTEGER,
+    options          TEXT,
+    image_url        TEXT,
+    bulk_pricing     TEXT,
+    PRIMARY KEY (product_key, variant_id)
+);
+
+-- Quick commerce reprices often; keeping the series makes a quote reproducible.
+CREATE TABLE IF NOT EXISTS price_history (
+    product_key  TEXT NOT NULL REFERENCES products(key) ON DELETE CASCADE,
+    observed_at  TEXT NOT NULL,
+    price        REAL,
+    availability TEXT,
+    PRIMARY KEY (product_key, observed_at)
+);
+
+CREATE TABLE IF NOT EXISTS embeddings (
+    product_key TEXT NOT NULL REFERENCES products(key) ON DELETE CASCADE,
+    kind        TEXT NOT NULL,      -- 'text' | 'image'
+    ref         TEXT NOT NULL,      -- '' for text, image url for image
+    model       TEXT NOT NULL,
+    dim         INTEGER NOT NULL,
+    vec         BLOB NOT NULL,      -- float32, L2-normalised
+    PRIMARY KEY (product_key, kind, ref, model)
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS products_fts USING fts5(
+    key UNINDEXED, name, brand, category_path, description, materials, colors, tags,
+    tokenize='porter unicode61'
+);
+"""
+
+_PRODUCT_COLS = [
+    "key", "source", "source_id", "url", "name", "brand", "product_type", "category",
+    "category_path", "design_category", "description", "description_html", "price",
+    "compare_at_price", "currency", "price_unit", "availability", "sku", "item_no",
+    "width_mm", "height_mm", "depth_mm", "length_mm", "diameter_mm", "dimensions",
+    "dimension_text", "weight_kg", "materials", "colors", "tags", "rating",
+    "review_count", "country", "attributes", "raw", "embedding_text", "content_hash",
+    "first_seen", "last_seen",
+]
+
+
+_UPSERT_SQL = (
+    f"INSERT INTO products ({','.join(_PRODUCT_COLS)}) "
+    f"VALUES ({','.join('?' * len(_PRODUCT_COLS))}) "
+    f"ON CONFLICT(key) DO UPDATE SET "
+    + ", ".join(f"{c}=excluded.{c}" for c in _PRODUCT_COLS if c != "key")
+)
+
+
+def _j(v: Any) -> str:
+    return json.dumps(v, ensure_ascii=False)
+
+
+def connect(db_path: str | Path) -> sqlite3.Connection:
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(SCHEMA)
+    return conn
+
+
+def _content_hash(p: Product) -> str:
+    """Hash of everything stored that can change between crawls.
+
+    Derived fields belong in here too, not just scraped ones: `design_category`
+    comes from a keyword taxonomy that gets edited, and if the hash ignored it a
+    re-parse would be silently discarded as "unchanged".
+    """
+    payload = _j([
+        p.url, p.name, p.brand, p.price, p.compare_at_price, p.availability,
+        p.price_unit, p.sku, p.description, p.materials, p.colors, p.tags,
+        p.dimensions, p.weight_kg, [i.url for i in p.images], p.category_path,
+        p.category, p.product_type, p.design_category, p.rating,
+        [(v.variant_id, v.price, v.available, v.quantity) for v in p.variants],
+    ])
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def upsert(conn: sqlite3.Connection, products: Iterable[Product]) -> dict[str, int]:
+    """Insert or update products. Returns counts of new / changed / unchanged."""
+    now = datetime.now(timezone.utc).isoformat()
+    stats = {"new": 0, "changed": 0, "unchanged": 0}
+
+    for p in products:
+        chash = _content_hash(p)
+        row = conn.execute(
+            "SELECT content_hash, first_seen, price, availability FROM products WHERE key=?",
+            (p.key,),
+        ).fetchone()
+
+        if row and row["content_hash"] == chash:
+            conn.execute("UPDATE products SET last_seen=? WHERE key=?", (now, p.key))
+            stats["unchanged"] += 1
+            continue
+
+        stats["new" if row is None else "changed"] += 1
+        d = p.dimensions or {}
+        values = {
+            "key": p.key, "source": p.source, "source_id": p.source_id, "url": p.url,
+            "name": p.name, "brand": p.brand, "product_type": p.product_type,
+            "category": p.category, "category_path": _j(p.category_path),
+            "design_category": p.design_category, "description": p.description,
+            "description_html": p.description_html, "price": p.price,
+            "compare_at_price": p.compare_at_price, "currency": p.currency,
+            "price_unit": p.price_unit, "availability": p.availability, "sku": p.sku,
+            "item_no": p.item_no,
+            "width_mm": d.get("width_mm"), "height_mm": d.get("height_mm"),
+            "depth_mm": d.get("depth_mm"), "length_mm": d.get("length_mm"),
+            "diameter_mm": d.get("diameter_mm"),
+            "dimensions": _j(d), "dimension_text": _j(p.dimension_text),
+            "weight_kg": p.weight_kg, "materials": _j(p.materials),
+            "colors": _j(p.colors), "tags": _j(p.tags), "rating": p.rating,
+            "review_count": p.review_count, "country": p.country,
+            "attributes": _j(p.attributes), "raw": _j(p.raw),
+            "embedding_text": p.embedding_text(), "content_hash": chash,
+            "first_seen": row["first_seen"] if row else now, "last_seen": now,
+        }
+        # A real upsert, not INSERT OR REPLACE: REPLACE deletes the existing row
+        # first, and the ON DELETE CASCADE on price_history would take the whole
+        # price series with it every time a product was re-crawled.
+        conn.execute(_UPSERT_SQL, [values[c] for c in _PRODUCT_COLS])
+
+        # Images and variants are replaced wholesale; they are small and ordered.
+        conn.execute("DELETE FROM product_images WHERE product_key=?", (p.key,))
+        conn.executemany(
+            "INSERT OR REPLACE INTO product_images "
+            "(product_key,position,url,alt,width,height,role,local_path,sha256) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            [
+                (p.key, i.position, i.url, i.alt, i.width, i.height, i.role,
+                 i.local_path, i.sha256)
+                for i in p.images
+            ],
+        )
+        conn.execute("DELETE FROM product_variants WHERE product_key=?", (p.key,))
+        conn.executemany(
+            "INSERT OR REPLACE INTO product_variants "
+            "(product_key,variant_id,title,sku,price,compare_at_price,available,"
+            "quantity,options,image_url,bulk_pricing) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                (p.key, v.variant_id, v.title, v.sku, v.price, v.compare_at_price,
+                 int(v.available) if v.available is not None else None, v.quantity,
+                 _j(v.options), v.image_url, _j(v.bulk_pricing))
+                for v in p.variants
+            ],
+        )
+
+        if row is None or row["price"] != p.price or row["availability"] != p.availability:
+            conn.execute(
+                "INSERT OR REPLACE INTO price_history VALUES (?,?,?,?)",
+                (p.key, now, p.price, p.availability),
+            )
+
+        conn.execute("DELETE FROM products_fts WHERE key=?", (p.key,))
+        conn.execute(
+            "INSERT INTO products_fts (key,name,brand,category_path,description,"
+            "materials,colors,tags) VALUES (?,?,?,?,?,?,?,?)",
+            (p.key, p.name, p.brand or "", " ".join(p.category_path),
+             (p.description or "")[:4000], " ".join(p.materials),
+             " ".join(p.colors), " ".join(p.tags)),
+        )
+
+    conn.commit()
+    return stats
+
+
+def load_jsonl(conn: sqlite3.Connection, path: str | Path, batch: int = 500) -> dict[str, int]:
+    """Stream a scrape's JSONL into the database."""
+    totals = {"new": 0, "changed": 0, "unchanged": 0}
+    chunk: list[Product] = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            chunk.append(Product.from_dict(json.loads(line)))
+            if len(chunk) >= batch:
+                for k, v in upsert(conn, chunk).items():
+                    totals[k] += v
+                chunk.clear()
+    if chunk:
+        for k, v in upsert(conn, chunk).items():
+            totals[k] += v
+    return totals
+
+
+def stats(conn: sqlite3.Connection) -> dict[str, Any]:
+    q = lambda sql: conn.execute(sql).fetchall()  # noqa: E731
+    return {
+        "products": conn.execute("SELECT COUNT(*) c FROM products").fetchone()["c"],
+        "images": conn.execute("SELECT COUNT(*) c FROM product_images").fetchone()["c"],
+        "images_downloaded": conn.execute(
+            "SELECT COUNT(*) c FROM product_images WHERE local_path IS NOT NULL"
+        ).fetchone()["c"],
+        "embeddings": conn.execute("SELECT COUNT(*) c FROM embeddings").fetchone()["c"],
+        "by_source": {r["source"]: r["c"] for r in q(
+            "SELECT source, COUNT(*) c FROM products GROUP BY source ORDER BY c DESC")},
+        "by_design_category": {r["design_category"] or "(unclassified)": r["c"] for r in q(
+            "SELECT design_category, COUNT(*) c FROM products "
+            "GROUP BY design_category ORDER BY c DESC")},
+        "priced": conn.execute(
+            "SELECT COUNT(*) c FROM products WHERE price IS NOT NULL").fetchone()["c"],
+    }

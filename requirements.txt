@@ -1,0 +1,8 @@
+requests>=2.31
+lxml>=5.0
+beautifulsoup4>=4.12
+
+# Optional, for embeddings + vector search. Install when you get to that step:
+#   pip install open_clip_torch torch pillow
+#   pip install sqlite-vec          # vector index inside SQLite (zero infra)
+#   pip install psycopg[binary]     # if you move to Postgres + pgvector
