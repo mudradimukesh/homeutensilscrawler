@@ -91,6 +91,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--min-price", type=float)
     p.add_argument("--source", choices=sorted(SOURCES))
     p.add_argument("--in-stock", action="store_true")
+    p.add_argument("--eligible", action="store_true",
+                   help="only products complete enough to place in a room")
     p.add_argument("-k", type=int, default=10)
     p.add_argument("--json", action="store_true")
     p.add_argument("--no-vectors", action="store_true", help="keyword only, no CLIP")
@@ -157,6 +159,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--target-total", type=int,
                    help="score coverage as if the catalogue held this many products")
     p.add_argument("--weights")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("quality", help="how much of the catalogue is complete enough to place")
     p.add_argument("--json", action="store_true")
 
     p = sub.add_parser("du", help="how much disk the catalogue is using")
@@ -233,6 +238,7 @@ def main(argv: list[str] | None = None) -> int:
             design_category=args.category, min_price=args.min_price,
             max_price=args.max_price, source=args.source,
             in_stock_only=args.in_stock, k=args.k, embedder=_embedder(args),
+            eligible_only=args.eligible,
         )
         if args.json:
             print(dump([r.to_dict() for r in results]))
@@ -302,6 +308,52 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "coverage":
         cov = coverage(store.connect(args.db), _weights(args.weights), args.target_total)
         print(dump(cov) if args.json else format_coverage(cov))
+        return 0
+
+    if args.cmd == "quality":
+        conn = store.connect(args.db)
+        rows = conn.execute("""
+            SELECT COALESCE(design_category,'(none)') AS cat,
+                   COALESCE(placement_geometry,'?')   AS geom,
+                   COUNT(*) AS n,
+                   SUM(searchable)            AS searchable,
+                   SUM(design_eligible)       AS eligible,
+                   SUM(dimensions_complete)   AS dims,
+                   SUM(primary_image_available) AS img,
+                   SUM(stock_known)           AS stock,
+                   SUM(material_known)        AS mat,
+                   SUM(color_known)           AS col,
+                   SUM(render_asset_quality >= 3) AS render3
+              FROM products GROUP BY 1, 2 ORDER BY n DESC
+        """).fetchall()
+        totals = conn.execute(
+            "SELECT COUNT(*) n, SUM(searchable) s, SUM(design_eligible) e FROM products"
+        ).fetchone()
+        if args.json:
+            print(dump({"totals": dict(totals), "by_category": [dict(r) for r in rows]}))
+            return 0
+        pct = lambda a, b: f"{100 * (a or 0) // b}%" if b else "-"   # noqa: E731
+        print(f"catalogue completeness: {totals['n']:,} products · "
+              f"{totals['s'] or 0:,} searchable · {totals['e'] or 0:,} placeable\n")
+        print(f"  {'category':<18}{'geometry':<11}{'n':>6}{'dims':>7}{'image':>7}"
+              f"{'stock':>7}{'render':>8}{'PLACEABLE':>11}")
+        for r in rows:
+            n = r["n"]
+            print(f"  {r['cat']:<18}{r['geom']:<11}{n:>6}{pct(r['dims'], n):>7}"
+                  f"{pct(r['img'], n):>7}{pct(r['stock'], n):>7}{pct(r['render3'], n):>8}"
+                  f"{pct(r['eligible'], n):>11}")
+        gaps = conn.execute(
+            "SELECT quality_gaps FROM products WHERE design_eligible = 0 AND quality_gaps IS NOT NULL"
+        ).fetchall()
+        tally = {}
+        for g in gaps:
+            for item in json.loads(g["quality_gaps"] or "[]"):
+                key = item.split(":")[0]
+                tally[key] = tally.get(key, 0) + 1
+        if tally:
+            print("\n  why products are not placeable:")
+            for k, v in sorted(tally.items(), key=lambda kv: -kv[1]):
+                print(f"    {k:<22}{v:>7,}")
         return 0
 
     if args.cmd == "du":

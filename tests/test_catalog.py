@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -254,6 +255,147 @@ def test_plan_emits_every_url_when_unlimited():
     assert sorted(out) == sorted(urls), "stratifying must not drop or duplicate URLs"
 
 
+# -- IKEA offer parsing ----------------------------------------------------
+def _ikea_page(aggregate: bool, offercount: int = 1) -> str:
+    """Minimal stand-in for an IKEA product page: the two hydrate blocks the
+    parser reads, plus the JSON-LD block that carries the offer."""
+    product = json.dumps({"product": {
+        "itemNo": "10471234", "visibleItemNo": "104.712.34", "name": "VIHALS",
+        "typeName": "wardrobe", "currencyCode": "INR", "price": 24990,
+        "mediaList": [{"type": "image", "content": {
+            "url": "https://x/img.jpg", "alt": "a", "width": 2000, "height": 2000,
+            "type": "MAIN_PRODUCT_IMAGE"}}],
+        "packageMeasurements": [], "subProducts": [],
+    }})
+    page = json.dumps({"pageProps": {
+        "pipPriceModuleProps": {"priceModuleProps": {"priceOfferType": "family"}},
+        "productInformationSectionProps": {},
+    }})
+    offers = ({"@type": "AggregateOffer", "lowPrice": "20990", "highPrice": "24990",
+               "offercount": offercount,
+               "offers": [{"@type": "Offer", "availability": "https://schema.org/InStock",
+                           "price": "20990", "priceCurrency": "INR"}]}
+              if aggregate else
+              {"@type": "Offer", "availability": "https://schema.org/InStock",
+               "price": "24990", "priceCurrency": "INR"})
+    ld = json.dumps({"@context": "https://schema.org/", "@type": "Product",
+                     "name": "VIHALS Wardrobe", "offers": offers,
+                     "width": "105 cm (41 3/8 \")", "height": "200 cm (78 3/4 \")",
+                     "depth": "57 cm (22 1/2 \")", "material": "Wood, Glass",
+                     "color": "white"})
+    return (f'<script type="text/hydrate">{product}</script>'
+            f'<script type="text/hydrate">{page}</script>'
+            f'<script type="application/ld+json">{ld}</script>')
+
+
+def test_aggregate_offer_availability_is_read_from_the_nested_offer():
+    from catalog.sources.ikea_in import IkeaIndia
+    # An AggregateOffer carries no availability of its own. Reading only the flat
+    # field left every ranged-price product "unknown", which disqualified it from
+    # being placed in a room.
+    p = IkeaIndia(None).parse("https://www.ikea.com/in/en/p/vihals-10471234/",
+                              _ikea_page(aggregate=True))
+    assert p.availability == "in_stock"
+    flat = IkeaIndia(None).parse("https://www.ikea.com/in/en/p/vihals-10471234/",
+                                 _ikea_page(aggregate=False))
+    assert flat.availability == "in_stock"
+
+
+def test_member_discount_is_not_an_unresolved_price():
+    from catalog.quality import assess
+    from catalog.sources.ikea_in import IkeaIndia
+    p = IkeaIndia(None).parse("https://www.ikea.com/in/en/p/vihals-10471234/",
+                              _ikea_page(aggregate=True, offercount=1))
+    # The quoted price is the one anyone pays; the member price sits beside it.
+    assert p.price == 24990
+    assert p.attributes["member_price"] == 20990
+    assert p.attributes["price_varies"] is False
+    assert assess(p, last_seen=datetime.now(timezone.utc).isoformat())["variant_resolved"] == 1
+
+    multi = IkeaIndia(None).parse("https://www.ikea.com/in/en/p/vihals-10471234/",
+                                  _ikea_page(aggregate=True, offercount=3))
+    assert multi.attributes["price_varies"] is True
+
+
+def test_jsonld_supplies_dimensions_the_accordion_omits():
+    from catalog.sources.ikea_in import IkeaIndia
+    p = IkeaIndia(None).parse("https://www.ikea.com/in/en/p/vihals-10471234/",
+                              _ikea_page(aggregate=True))
+    assert p.dimensions == {"width_mm": 1050.0, "height_mm": 2000.0, "depth_mm": 570.0}
+    assert p.materials == ["Wood", "Glass"]
+
+
+# -- completeness ----------------------------------------------------------
+def test_flat_goods_are_not_judged_as_boxes():
+    from catalog.quality import missing_axes
+    # A rug has width and length and no height or depth. Judging it as a box
+    # marks every rug in the catalogue unplaceable.
+    rug = {"width_mm": 800.0, "length_mm": 1500.0}
+    assert missing_axes(rug, "planar") == []
+    assert missing_axes(rug, "box") == ["height"]
+    # IKEA reports a bed as width x length, never width x depth.
+    bed = {"width_mm": 1600.0, "length_mm": 2000.0}
+    assert missing_axes(bed, "footprint") == []
+
+
+def test_geometry_is_category_specific():
+    from catalog.quality import geometry_for
+    assert geometry_for("rugs") == "planar"
+    assert geometry_for("wardrobes") == "box"
+    assert geometry_for("ceiling_lighting") == "suspended"
+    # Bought for a room, never placed in one as an object.
+    assert geometry_for("paint") == "none"
+    assert geometry_for("structural") == "none"
+
+
+def test_searchable_and_eligible_are_different_questions():
+    from catalog.quality import assess
+    p = _product("bed1", 12990.0, "MALM Bed frame")
+    p.design_category = "beds"
+    p.materials, p.colors = ["particleboard"], ["white"]
+
+    p.dimensions = {}
+    without = assess(p, last_seen=datetime.now(timezone.utc).isoformat())
+    assert without["searchable"] == 1, "a named, priced, pictured bed is findable"
+    assert without["design_eligible"] == 0, "but it cannot be placed without a size"
+    assert any(g.startswith("dimensions:") for g in without["quality_gaps"])
+
+    p.dimensions = {"width_mm": 1600.0, "length_mm": 2000.0}
+    with_dims = assess(p, last_seen=datetime.now(timezone.utc).isoformat())
+    assert with_dims["design_eligible"] == 1
+
+
+def test_stale_price_blocks_eligibility():
+    from catalog.quality import assess
+    p = _product("bed2", 12990.0, "MALM Bed frame")
+    p.design_category, p.dimensions = "beds", {"width_mm": 1600.0, "length_mm": 2000.0}
+    old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    marks = assess(p, last_seen=old)
+    assert marks["price_current"] == 0 and marks["design_eligible"] == 0
+    assert "price_stale" in marks["quality_gaps"]
+
+
+def test_materials_stay_searchable_but_never_placeable():
+    from catalog.quality import assess
+    p = _product("cem", 355.0, "Maha PPC Cement, 50 Kg Bag")
+    p.design_category = "structural"
+    marks = assess(p, last_seen=datetime.now(timezone.utc).isoformat())
+    assert marks["searchable"] == 1
+    assert marks["design_eligible"] == 0
+    assert marks["placement_geometry"] == "none"
+    # Not a data gap - cement simply is not placed as an object.
+    assert not any(g.startswith("dimensions:") for g in marks["quality_gaps"])
+
+
+def test_pricing_requires_placement_only_where_it_applies(tmp_path="/tmp"):
+    from catalog.search import _requires_placement
+    assert _requires_placement("beds") is True
+    assert _requires_placement("rugs") is True
+    # A renovation quote must still be able to price paint and cement.
+    assert _requires_placement("paint") is False
+    assert _requires_placement("structural") is False
+
+
 # -- disk budget -----------------------------------------------------------
 def test_parse_size():
     assert parse_size("1GB") == 1024 ** 3
@@ -386,7 +528,7 @@ def test_confidence_floor_rejects_a_nonsense_match(tmp_path="/tmp"):
     quote = price_design(
         conn, [{"label": "brass chandelier with crystal drops",
                 "design_category": "ceiling_lighting", "quantity": 1}],
-        embedder=None,
+        embedder=None, eligible_only=False,      # this test is about the floor, not completeness
     )
     line = quote["lines"][0]
     assert line["matched"] is None, "a spot light box is not a brass chandelier"

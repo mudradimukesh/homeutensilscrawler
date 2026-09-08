@@ -23,6 +23,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from .embed import Embedder, load_matrix
+from .quality import geometry_for
 from .taxonomy import expand_category
 
 log = logging.getLogger(__name__)
@@ -58,6 +59,9 @@ class Match:
     availability: str = "unknown"
     price_unit: str | None = None
     product_hint: str | None = None      # source product_type, for confidence checks
+    design_eligible: bool = False
+    placement_geometry: str | None = None
+    quality_gaps: list[str] = field(default_factory=list)
     image: str | None = None
     score: float = 0.0
     signals: dict[str, float] = field(default_factory=dict)
@@ -75,6 +79,16 @@ def _fts_query(text: str) -> str | None:
     return " OR ".join(f'"{w}"' for w in dict.fromkeys(words).keys()) or None
 
 
+def _requires_placement(design_category: str | None) -> bool:
+    """Whether products in this category are placed in a room as objects.
+
+    Paint and cement are bought for a room but never placed in one, so demanding
+    placement data of them would drop every material line from a renovation quote.
+    """
+    fine = expand_category(design_category) or [design_category]
+    return any(geometry_for(c) != "none" for c in fine if c)
+
+
 def _filter_sql(
     design_category: str | None,
     min_price: float | None,
@@ -82,8 +96,13 @@ def _filter_sql(
     source: str | None,
     in_stock_only: bool,
     exclude: Sequence[str] | None,
+    eligible_only: bool | str = False,
 ) -> tuple[str, list[Any]]:
     clauses, params = ["1=1"], []
+    if eligible_only == "auto":
+        eligible_only = _requires_placement(design_category)
+    if eligible_only:
+        clauses.append("design_eligible = 1")
     if design_category:
         # "lighting" must reach lamps and ceiling fittings alike, so a coarse
         # name expands to the fine categories it covers.
@@ -125,9 +144,15 @@ def find_products(
     k: int = 10,
     embedder: Embedder | None = None,
     candidate_pool: int = 400,
+    eligible_only: bool | str = False,
 ) -> list[Match]:
-    """Hybrid search over the catalogue. Works with keywords alone if nothing is embedded."""
-    where, params = _filter_sql(design_category, min_price, max_price, source, in_stock_only, exclude)
+    """Hybrid search over the catalogue. Works with keywords alone if nothing is embedded.
+
+    `eligible_only=True` restricts to products that can actually be placed in a
+    room; "auto" applies that test only to categories that are placed at all.
+    """
+    where, params = _filter_sql(design_category, min_price, max_price, source,
+                                in_stock_only, exclude, eligible_only)
     allowed = {r["key"] for r in conn.execute(f"SELECT key FROM products WHERE {where}", params)}
     if not allowed:
         return []
@@ -228,6 +253,9 @@ def _hydrate(conn, scored: Sequence[tuple[str, float]], signals: dict) -> list[M
             design_category=r["design_category"], category=r["category"],
             availability=r["availability"], price_unit=r["price_unit"],
             product_hint=r["product_type"],
+            design_eligible=bool(r["design_eligible"]),
+            placement_geometry=r["placement_geometry"],
+            quality_gaps=json.loads(r["quality_gaps"] or "[]"),
             image=images.get(key), score=round(score, 6), signals=signals.get(key, {}),
         ))
     return out
@@ -280,6 +308,7 @@ def price_design(
     in_stock_only: bool = True,
     alternates: int = 3,
     min_confidence: float = 0.34,
+    eligible_only: bool | str = "auto",
 ) -> dict[str, Any]:
     """Cost the object list a design produced.
 
@@ -317,9 +346,23 @@ def price_design(
             exclude=used,
             k=alternates + 4,
             embedder=embedder,
+            eligible_only=eligible_only,
         )
         if not matches:
-            lines.append(LineItem(label, qty, None, None, None, note="no catalogue match"))
+            # Say which wall was hit: nothing in the catalogue, or nothing in it
+            # complete enough to place.
+            note = "no catalogue match"
+            if eligible_only:
+                relaxed = find_products(
+                    conn, query_text=query, design_category=raw.get("design_category"),
+                    max_price=raw.get("max_price"), source=raw.get("source"),
+                    in_stock_only=in_stock_only, exclude=used, k=1,
+                    embedder=embedder, eligible_only=False,
+                )
+                if relaxed:
+                    note = ("matches exist but none are complete enough to place — "
+                            + ", ".join(relaxed[0].quality_gaps[:3]))
+            lines.append(LineItem(label, qty, None, None, None, note=note))
             unmatched += 1
             continue
 

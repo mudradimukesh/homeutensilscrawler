@@ -205,10 +205,26 @@ class IkeaIndia(Source):
             maxm = (mprops.get("packaging", {}).get("contentProps", {}) or {}).get("maxMeasurements") or {}
             weight = parse_weight_kg(maxm.get("weightText"))
 
+        # ---- dimensions: JSON-LD as a fallback ------------------------------
+        # The measurements accordion is richer but not always present; the
+        # JSON-LD block states width/height/depth in the same "105 cm (41 3/8 ")"
+        # form for hundreds of products the accordion skips.
+        for prop, axis in (("width", "width_mm"), ("height", "height_mm"),
+                           ("depth", "depth_mm")):
+            if axis in dims:
+                continue
+            stated = ld_product.get(prop)
+            value = parse_length_mm(stated) if isinstance(stated, str) else None
+            if value:
+                dims[axis] = value
+                dim_text.append(f"{prop.title()}: {stated}")
+
         # ---- materials, care, good-to-know ---------------------------------
         details = (info.get("productDetailsProps") or {}).get("accordionObject") or {}
         mat_node = (details.get("materialsAndCare") or {}).get("contentProps") or {}
         materials = sorted(set(_walk_strings(mat_node.get("materials"), "material")))
+        if not materials and isinstance(ld_product.get("material"), str):
+            materials = [m.strip() for m in ld_product["material"].split(",") if m.strip()]
         care = [
             {"header": c.get("header"), "texts": c.get("texts", [])}
             for c in mat_node.get("careInstructions", []) or []
@@ -231,7 +247,34 @@ class IkeaIndia(Source):
         category = ld_product.get("category") or (crumbs[-1] if crumbs else None)
 
         # ---- price & availability -------------------------------------------
+        # Anything sold across a price range comes as an AggregateOffer, which
+        # carries no availability of its own — the real one is in the nested
+        # offer. Reading only the flat field left every PAX-style wardrobe and
+        # chest marked "unknown", and unknown stock disqualifies a product from
+        # being placed in a room.
         offers = ld_product.get("offers") or {}
+        price_low = price_high = None
+        offer_count = 1
+        if str(offers.get("@type", "")).endswith("AggregateOffer"):
+            price_low, price_high = offers.get("lowPrice"), offers.get("highPrice")
+            offer_count = int(offers.get("offercount") or offers.get("offerCount") or 1)
+            nested = offers.get("offers") or []
+            offers = nested[0] if nested else {}
+
+        # A low/high spread here is almost always an IKEA Family member price,
+        # not a configuration range: every discounted page sampled carried
+        # offercount 1 and priceOfferType "family". The regular price stays the
+        # quoted one — it is what a customer without a membership pays — and the
+        # member price is recorded beside it.
+        price_module = ((page.get("pipPriceModuleProps") or {}).get("priceModuleProps") or {})
+        offer_type = price_module.get("priceOfferType")
+        member_price = None
+        if price_low and price_high and price_low != price_high:
+            try:
+                member_price = min(float(price_low), float(price_high))
+            except (TypeError, ValueError):
+                member_price = None
+
         price = item.get("price")
         if not isinstance(price, (int, float)):
             try:
@@ -314,6 +357,10 @@ class IkeaIndia(Source):
                 "number_of_packages": item.get("numberOfPackages"),
                 "is_custom_made": item.get("isCustomMade"),
                 "buyable_online": not bool(view.get("product_not_buyable_online")),
+                "member_price": member_price,
+                "price_offer_type": offer_type,
+                # Only a genuine multi-offer listing leaves the price unresolved.
+                "price_varies": offer_count > 1,
             },
             raw={"salesItem": item, "measurements": mprops.get("measurements"), "jsonld": ld_product},
         )

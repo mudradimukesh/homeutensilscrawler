@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .models import Product
+from .quality import QUALITY_COLUMNS, assess
 
 log = logging.getLogger(__name__)
 
@@ -64,7 +65,24 @@ CREATE TABLE IF NOT EXISTS products (
     embedding_text   TEXT,
     content_hash     TEXT,
     first_seen       TEXT,
-    last_seen        TEXT
+    last_seen        TEXT,
+    -- Completeness, derived on write. `searchable` answers "can this be found";
+    -- `design_eligible` answers "can this be placed in a room without guessing
+    -- its size". A bag of cement is the first and never the second.
+    placement_geometry      TEXT,
+    dimensions_complete     INTEGER DEFAULT 0,
+    primary_image_available INTEGER DEFAULT 0,
+    alternate_views_count   INTEGER DEFAULT 0,
+    price_current           INTEGER DEFAULT 0,
+    stock_known             INTEGER DEFAULT 0,
+    variant_resolved        INTEGER DEFAULT 0,
+    material_known          INTEGER DEFAULT 0,
+    color_known             INTEGER DEFAULT 0,
+    placement_safe          INTEGER DEFAULT 0,
+    render_asset_quality    INTEGER DEFAULT 0,
+    searchable              INTEGER DEFAULT 0,
+    design_eligible         INTEGER DEFAULT 0,
+    quality_gaps            TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_products_design  ON products(design_category);
 CREATE INDEX IF NOT EXISTS idx_products_source  ON products(source);
@@ -150,7 +168,7 @@ _PRODUCT_COLS = [
     "dimension_text", "weight_kg", "materials", "colors", "tags", "rating",
     "review_count", "country", "attributes", "raw", "embedding_text", "content_hash",
     "first_seen", "last_seen",
-]
+] + list(QUALITY_COLUMNS)
 
 
 _UPSERT_SQL = (
@@ -171,7 +189,34 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns a database created by an earlier version is missing.
+
+    CREATE TABLE IF NOT EXISTS silently leaves an existing table alone, so new
+    columns have to be added explicitly or a live catalogue breaks on upgrade.
+    """
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(products)")}
+    added = [c for c in QUALITY_COLUMNS if c not in have]
+    for col in added:
+        conn.execute(f"ALTER TABLE products ADD COLUMN {col} {QUALITY_COLUMNS[col]}")
+    if added:
+        # Existing rows have NULL in the new columns and would be skipped as
+        # "unchanged" forever, so clear the hash to force one re-derivation.
+        conn.execute("UPDATE products SET content_hash = NULL")
+        log.info("migrated products: added %s (existing rows will re-derive)",
+                 ", ".join(added))
+    # Indexed after the migration: on an existing database the columns do not
+    # exist until the ALTER TABLEs above have run.
+    conn.executescript(
+        "CREATE INDEX IF NOT EXISTS idx_products_eligible ON products(design_eligible);"
+        "CREATE INDEX IF NOT EXISTS idx_products_searchable ON products(searchable);"
+        "CREATE INDEX IF NOT EXISTS idx_products_geometry ON products(placement_geometry);"
+    )
+    conn.commit()
 
 
 def _content_hash(p: Product) -> str:
@@ -230,6 +275,11 @@ def upsert(conn: sqlite3.Connection, products: Iterable[Product]) -> dict[str, i
             "embedding_text": p.embedding_text(), "content_hash": chash,
             "first_seen": row["first_seen"] if row else now, "last_seen": now,
         }
+        # Completeness is derived from the values just assembled, so it can never
+        # drift out of step with the row it describes.
+        marks = assess(p, last_seen=now)
+        marks["quality_gaps"] = _j(marks["quality_gaps"])
+        values.update(marks)
         # A real upsert, not INSERT OR REPLACE: REPLACE deletes the existing row
         # first, and the ON DELETE CASCADE on price_history would take the whole
         # price series with it every time a product was re-crawled.
@@ -300,7 +350,13 @@ def load_jsonl(conn: sqlite3.Connection, path: str | Path, batch: int = 500) -> 
             line = line.strip()
             if not line:
                 continue
-            chunk.append(Product.from_dict(json.loads(line)))
+            try:
+                chunk.append(Product.from_dict(json.loads(line)))
+            except json.JSONDecodeError:
+                # The crawl appends as it runs, so the last line may be half
+                # written. Skip it; the next load picks it up complete.
+                log.warning("skipping malformed line in %s", Path(path).name)
+                continue
             if len(chunk) >= batch:
                 for k, v in upsert(conn, chunk).items():
                     totals[k] += v
