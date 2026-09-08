@@ -1,9 +1,9 @@
-data/cache/
-data/images/
-data/*.jsonl
-data/*.db
-data/*.db-wal
-data/*.db-shm
+# Everything under data/ is crawled, derived or generated. The JSONL and images
+# are durable catalogue state, but they are large and belong in a backup, not in
+# git; the database and caches are rebuildable from them.
+data/
+
 __pycache__/
 *.pyc
 .venv/
+.DS_Store
