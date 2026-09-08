@@ -38,6 +38,22 @@ python3 -m catalog search "white pendant lamp for the ceiling" --no-vectors
  2. YTLÄGE Pendant lamp - white 43 cm (17 ")                Rs.3,490 each
 ```
 
+## Browsing what has been catalogued
+
+```bash
+python3 -m catalog web
+```
+
+Opens a browser view of the database at <http://127.0.0.1:8765> — grid or table, faceted by
+source, design category, brand, availability and price, with full-text search across names,
+materials and colours. Clicking a product shows everything stored for it: every image, the
+parsed dimensions, materials, variants with their bulk-price tiers, the price history, which
+embeddings exist, and the raw payload exactly as it was scraped. The sidebar carries a
+refresh history so you can see when the data last moved.
+
+Standard library only — no server framework. It reads the same SQLite file the CLI writes,
+so it always shows the current state; leave it running while a crawl loads and reload.
+
 ## The pipeline
 
 ```
@@ -70,6 +86,52 @@ python3 -m catalog embed
 request rate — they only hide latency. Crawls resume: an interrupted run picks up from the
 URLs already in the JSONL, and pages are cached on disk, so a re-run after a parser change
 costs nothing.
+
+## Keeping it fresh
+
+A first crawl and a re-crawl are not the same job. `scrape` resumes past what it already has
+and serves pages from cache — right when you are building a parser, wrong for a catalogue
+whose prices move daily. `refresh` does the opposite: it re-fetches, rewrites each source's
+JSONL rather than appending, loads, pulls new images, embeds what is new, and reports what
+actually changed.
+
+```bash
+python3 -m catalog refresh                     # one full cycle
+python3 -m catalog refresh --stale-after 6h    # reuse pages fetched in the last 6 hours
+```
+
+```
+refresh #3 ok in 0.8s
+  pages   ok=30 failed=0
+  products new=0 changed=2
+  images  +0   embeddings +0
+  price changes (2):
+    Maha PPC Cement, 50 Kg Bag         300 -> 355
+    Ultratech PPC Cement, 50 Kg Bag    450 -> 410
+```
+
+Run it on a schedule:
+
+```bash
+python3 -m catalog schedule install --at 03:30
+python3 -m catalog schedule status
+python3 -m catalog schedule uninstall
+```
+
+On macOS this installs a **launchd** LaunchAgent, not a cron job — it survives reboots and
+logouts, and launchd runs a calendar job it missed while the machine was asleep, which cron
+does not. A laptop is asleep at 03:30 most nights, so that difference is the whole point.
+The job runs at background priority with low-priority I/O so a crawl never competes with
+your own work. `--print-only` emits the equivalent systemd timer or crontab line for a
+Linux box, and `catalog watch --every 12h` is the in-process loop for a container.
+
+Every run is recorded in a `crawl_runs` table — start, finish, pages, new and changed
+products, reprices, failures — which is what `schedule status` and the web view read.
+Two refreshes cannot overlap: a PID lock file guards the crawl, and a lock left behind by a
+dead process is reclaimed rather than obeyed, so one crash does not stop tomorrow's run.
+
+Prices are never overwritten in place. Every observed change appends to `price_history`, so
+a quote issued last week can still be explained.
 
 ## Vector DB or a normal DB?
 
@@ -213,6 +275,10 @@ catalog/
   images.py       content-addressed image downloads
   embed.py        CLIP text and image embeddings
   search.py       hybrid retrieval + design pricing
+  refresh.py      one scheduled refresh cycle, with a lock and a change report
+  schedule.py     launchd agent (systemd/cron equivalents for Linux)
+  web.py          read-only JSON API + the browser view, standard library only
+  static/         the single-page UI
   postgres.sql    the same schema on Postgres + pgvector
-tests/            12 network-free tests: python3 tests/test_catalog.py
+tests/            18 network-free tests: python3 tests/test_catalog.py
 ```

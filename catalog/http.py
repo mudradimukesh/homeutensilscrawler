@@ -77,8 +77,12 @@ class Fetcher:
         timeout: int = 30,
         obey_robots: bool = True,
         max_retries: int = 3,
+        cache_max_age: float | None = None,
     ):
         self.cache_dir = Path(cache_dir)
+        # None = a cached page never expires (good while writing a parser);
+        # 0 = always refetch (what a scheduled refresh wants).
+        self.cache_max_age = cache_max_age
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.limiter = RateLimiter(delay)
         self.timeout = timeout
@@ -139,6 +143,10 @@ class Fetcher:
     def cached(self, url: str) -> str | None:
         p = self._cache_path(url)
         if p.exists():
+            if self.cache_max_age is not None and (
+                time.time() - p.stat().st_mtime > self.cache_max_age
+            ):
+                return None
             try:
                 return gzip.decompress(p.read_bytes()).decode("utf-8", "replace")
             except OSError:

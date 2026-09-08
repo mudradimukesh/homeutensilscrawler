@@ -44,13 +44,15 @@ def scrape(
     resume: bool = True,
     reparse: bool = False,
     obey_robots: bool = True,
+    cache_max_age: float | None = None,
 ) -> dict[str, int]:
     if source_name not in SOURCES:
         raise SystemExit(f"unknown source {source_name!r}; have {', '.join(SOURCES)}")
 
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fetcher = Fetcher(cache_dir=cache_dir, delay=delay, obey_robots=obey_robots)
+    fetcher = Fetcher(cache_dir=cache_dir, delay=delay, obey_robots=obey_robots,
+                      cache_max_age=cache_max_age)
     source = SOURCES[source_name](fetcher)
 
     if reparse and out_path.exists():

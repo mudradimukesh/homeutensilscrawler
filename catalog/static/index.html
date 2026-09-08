@@ -1,0 +1,513 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Interior Catalog</title>
+<style>
+  :root {
+    --bg:#f7f7f5; --panel:#ffffff; --ink:#1a1a19; --muted:#6b6b66; --line:#e3e3de;
+    --accent:#1f6f4a; --accent-soft:#e8f2ec; --warn:#8a5a00; --warn-soft:#fdf3e0;
+    --chip:#f0f0ec; --shadow:0 1px 2px rgba(0,0,0,.06), 0 8px 24px rgba(0,0,0,.06);
+    --radius:10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#141513; --panel:#1c1e1b; --ink:#eceae4; --muted:#9a9a92; --line:#2e312c;
+      --accent:#6fcf9a; --accent-soft:#1b2d23; --warn:#e0b060; --warn-soft:#2c2417;
+      --chip:#262924; --shadow:0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.35);
+    }
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--ink);
+    font:14px/1.5 ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  a { color:inherit; }
+  button, select, input { font:inherit; color:inherit; }
+
+  header {
+    position:sticky; top:0; z-index:20; background:var(--panel);
+    border-bottom:1px solid var(--line); padding:14px 20px;
+    display:flex; align-items:center; gap:16px; flex-wrap:wrap;
+  }
+  h1 { font-size:17px; margin:0; font-weight:650; letter-spacing:-.01em; }
+  .engine {
+    font-size:11px; font-weight:600; letter-spacing:.04em; text-transform:uppercase;
+    background:var(--accent-soft); color:var(--accent); padding:4px 9px; border-radius:99px;
+  }
+  .chips { display:flex; gap:8px; flex-wrap:wrap; margin-left:auto; }
+  .chip {
+    background:var(--chip); border-radius:99px; padding:4px 11px; font-size:12px;
+    color:var(--muted); white-space:nowrap;
+  }
+  .chip b { color:var(--ink); font-variant-numeric:tabular-nums; font-weight:650; }
+
+  .layout { display:grid; grid-template-columns:250px 1fr; gap:0; align-items:start; }
+  @media (max-width:860px) { .layout { grid-template-columns:1fr; } aside { position:static !important; } }
+
+  aside {
+    position:sticky; top:57px; max-height:calc(100vh - 57px); overflow:auto;
+    padding:18px; border-right:1px solid var(--line);
+  }
+  .field { margin-bottom:16px; }
+  .field label {
+    display:block; font-size:11px; text-transform:uppercase; letter-spacing:.05em;
+    color:var(--muted); margin-bottom:6px; font-weight:600;
+  }
+  .field input, .field select {
+    width:100%; padding:7px 9px; border:1px solid var(--line); border-radius:8px;
+    background:var(--panel);
+  }
+  .field input:focus, .field select:focus { outline:2px solid var(--accent); outline-offset:-1px; }
+  .row2 { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .checks label {
+    display:flex; align-items:center; gap:7px; font-size:13px; text-transform:none;
+    letter-spacing:0; color:var(--ink); font-weight:400; margin-bottom:6px;
+  }
+  .checks input { width:auto; }
+  .reset {
+    width:100%; padding:7px; border:1px solid var(--line); background:var(--panel);
+    border-radius:8px; cursor:pointer;
+  }
+  .reset:hover { border-color:var(--accent); color:var(--accent); }
+
+  main { padding:18px 20px 60px; min-width:0; }
+  .toolbar { display:flex; align-items:center; gap:12px; margin-bottom:16px; flex-wrap:wrap; }
+  .count { color:var(--muted); font-variant-numeric:tabular-nums; }
+  .count b { color:var(--ink); }
+  .seg { display:flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; margin-left:auto; }
+  .seg button { background:var(--panel); border:0; padding:6px 13px; cursor:pointer; color:var(--muted); }
+  .seg button[aria-pressed="true"] { background:var(--accent-soft); color:var(--accent); font-weight:600; }
+
+  .grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(190px,1fr)); gap:14px; }
+  .card {
+    background:var(--panel); border:1px solid var(--line); border-radius:var(--radius);
+    overflow:hidden; cursor:pointer; display:flex; flex-direction:column; text-align:left;
+    padding:0; transition:border-color .12s, transform .12s;
+  }
+  .card:hover { border-color:var(--accent); transform:translateY(-1px); }
+  .thumb {
+    aspect-ratio:1; background:var(--chip); display:flex; align-items:center;
+    justify-content:center; overflow:hidden;
+  }
+  .thumb img { width:100%; height:100%; object-fit:contain; }
+  .thumb .none { color:var(--muted); font-size:11px; }
+  .card .body { padding:10px 11px 12px; display:flex; flex-direction:column; gap:5px; flex:1; }
+  .card .nm { font-weight:550; line-height:1.35; font-size:13px; }
+  .card .meta { color:var(--muted); font-size:11.5px; display:flex; gap:6px; flex-wrap:wrap; }
+  .price { font-weight:650; font-variant-numeric:tabular-nums; margin-top:auto; }
+  .price small { font-weight:400; color:var(--muted); }
+  .strike { color:var(--muted); text-decoration:line-through; font-weight:400; font-size:12px; }
+  .tag {
+    font-size:10.5px; padding:2px 7px; border-radius:99px; background:var(--chip);
+    color:var(--muted); white-space:nowrap;
+  }
+  .tag.cat { background:var(--accent-soft); color:var(--accent); }
+  .tag.warn { background:var(--warn-soft); color:var(--warn); }
+
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  th, td { text-align:left; padding:7px 9px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.04em; position:sticky; top:57px; background:var(--bg); }
+  tbody tr { cursor:pointer; }
+  tbody tr:hover { background:var(--accent-soft); }
+  td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  td.wide { white-space:normal; min-width:260px; }
+  .tablewrap { overflow-x:auto; border:1px solid var(--line); border-radius:var(--radius); background:var(--panel); }
+
+  .pager { display:flex; gap:8px; align-items:center; justify-content:center; margin-top:24px; }
+  .pager button {
+    padding:6px 13px; border:1px solid var(--line); background:var(--panel);
+    border-radius:8px; cursor:pointer;
+  }
+  .pager button:disabled { opacity:.4; cursor:default; }
+
+  /* detail */
+  .scrim {
+    position:fixed; inset:0; background:rgba(0,0,0,.4); z-index:40;
+    opacity:0; pointer-events:none; transition:opacity .15s;
+  }
+  .scrim.on { opacity:1; pointer-events:auto; }
+  .drawer {
+    position:fixed; top:0; right:0; bottom:0; width:min(760px, 100%); z-index:50;
+    background:var(--panel); border-left:1px solid var(--line); box-shadow:var(--shadow);
+    transform:translateX(100%); transition:transform .18s ease; overflow:auto;
+  }
+  .drawer.on { transform:none; }
+  .drawer header { position:sticky; top:0; }
+  .drawer .content { padding:20px; }
+  .gallery { display:flex; gap:10px; overflow-x:auto; padding-bottom:6px; margin-bottom:18px; }
+  .gallery img {
+    height:170px; width:auto; border-radius:8px; border:1px solid var(--line);
+    background:var(--chip); object-fit:contain;
+  }
+  .kv { width:100%; font-size:13px; }
+  .kv th { width:30%; font-weight:500; color:var(--muted); text-transform:none; letter-spacing:0; font-size:13px; position:static; vertical-align:top; }
+  .kv td, .kv th { white-space:normal; padding:6px 8px; }
+  h3 { font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); margin:22px 0 8px; }
+  pre {
+    background:var(--chip); padding:12px; border-radius:8px; overflow:auto;
+    font-size:11.5px; max-height:340px; margin:0;
+  }
+  details summary { cursor:pointer; color:var(--muted); margin-bottom:8px; }
+  .desc { max-height:220px; overflow:auto; font-size:13px; color:var(--muted); }
+  .close {
+    background:var(--chip); border:0; border-radius:8px; width:30px; height:30px;
+    cursor:pointer; font-size:17px; line-height:1;
+  }
+  .empty { padding:60px 20px; text-align:center; color:var(--muted); }
+  .swatches { display:flex; gap:6px; flex-wrap:wrap; }
+  #runs-panel { margin-top:20px; font-size:12px; }
+  #runs-panel summary { font-size:11px; text-transform:uppercase; letter-spacing:.05em; font-weight:600; }
+  .run { padding:7px 0; border-bottom:1px solid var(--line); color:var(--muted); }
+  .run b { color:var(--ink); font-weight:600; }
+  .run .bad { color:var(--warn); }
+  .dot { display:inline-block; width:7px; height:7px; border-radius:99px; background:var(--accent); margin-right:5px; }
+  .dot.bad { background:var(--warn); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Interior Catalog</h1>
+  <span class="engine" id="engine">SQLite</span>
+  <div class="chips" id="chips"></div>
+</header>
+
+<div class="layout">
+  <aside>
+    <div class="field">
+      <label for="q">Search</label>
+      <input id="q" type="search" placeholder="name, material, colour…" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="source">Source</label>
+      <select id="source"><option value="">All sources</option></select>
+    </div>
+    <div class="field">
+      <label for="category">Design category</label>
+      <select id="category"><option value="">All categories</option></select>
+    </div>
+    <div class="field">
+      <label for="brand">Brand</label>
+      <select id="brand"><option value="">All brands</option></select>
+    </div>
+    <div class="field">
+      <label for="availability">Availability</label>
+      <select id="availability"><option value="">Any</option></select>
+    </div>
+    <div class="field">
+      <label>Price (₹)</label>
+      <div class="row2">
+        <input id="min_price" type="number" min="0" placeholder="min">
+        <input id="max_price" type="number" min="0" placeholder="max">
+      </div>
+    </div>
+    <div class="field checks">
+      <label><input type="checkbox" id="has_image"> Has downloaded image</label>
+      <label><input type="checkbox" id="unpriced"> Missing a price</label>
+    </div>
+    <div class="field">
+      <label for="sort">Sort</label>
+      <select id="sort">
+        <option value="name">Name</option>
+        <option value="relevance">Relevance</option>
+        <option value="price_asc">Price, low to high</option>
+        <option value="price_desc">Price, high to low</option>
+        <option value="newest">First seen</option>
+        <option value="updated">Last updated</option>
+      </select>
+    </div>
+    <button class="reset" id="reset">Clear filters</button>
+    <details id="runs-panel"><summary>Refresh history</summary>
+      <div id="runs"></div></details>
+  </aside>
+
+  <main>
+    <div class="toolbar">
+      <span class="count" id="count">Loading…</span>
+      <div class="seg">
+        <button id="view-grid" aria-pressed="true">Grid</button>
+        <button id="view-table" aria-pressed="false">Table</button>
+      </div>
+    </div>
+    <div id="results"></div>
+    <div class="pager" id="pager"></div>
+  </main>
+</div>
+
+<div class="scrim" id="scrim"></div>
+<div class="drawer" id="drawer" role="dialog" aria-label="Product detail">
+  <header>
+    <h1 id="d-title" style="flex:1; font-size:15px;">Product</h1>
+    <button class="close" id="d-close" aria-label="Close">&times;</button>
+  </header>
+  <div class="content" id="d-body"></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const state = { page: 1, view: 'grid', request: 0 };
+const FILTERS = ['q','source','category','brand','availability','min_price','max_price','sort'];
+const TOGGLES = ['has_image','unpriced'];
+
+const money = (v, cur) => v == null ? '—'
+  : (cur === 'INR' ? '₹' : (cur || '') + ' ') + Number(v).toLocaleString('en-IN',
+      { maximumFractionDigits: 2 });
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
+  ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+
+function thumbSrc(item, w) {
+  if (item.image_sha) return `/api/image?sha=${item.image_sha}&w=${w}`;
+  return item.image_url || '';
+}
+
+function params() {
+  const p = new URLSearchParams();
+  FILTERS.forEach(k => { const v = $('#' + k).value.trim(); if (v) p.set(k, v); });
+  TOGGLES.forEach(k => { if ($('#' + k).checked) p.set(k, '1'); });
+  p.set('page', state.page);
+  return p;
+}
+
+async function load() {
+  const token = ++state.request;          // ignore responses from superseded requests
+  let data;
+  try {
+    const res = await fetch('/api/products?' + params());
+    data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.detail || data.error || res.status);
+  } catch (err) {
+    if (token !== state.request) return;
+    $('#count').textContent = 'Request failed';
+    $('#results').innerHTML = `<div class="empty">Could not load products.<br>
+      <code>${esc(err.message)}</code></div>`;
+    $('#pager').innerHTML = '';
+    return;
+  }
+  if (token !== state.request) return;
+  render(data);
+}
+
+function render(data) {
+  const { items, total, page, pages } = data;
+  $('#count').innerHTML = total
+    ? `<b>${total.toLocaleString('en-IN')}</b> product${total === 1 ? '' : 's'}`
+      + (pages > 1 ? ` · page ${page} of ${pages}` : '')
+    : 'No products match these filters';
+
+  const box = $('#results');
+  if (!items.length) {
+    box.innerHTML = '<div class="empty">Nothing here. Try clearing a filter, '
+      + 'or run <code>python3 -m catalog scrape all</code> then <code>load</code>.</div>';
+  } else if (state.view === 'grid') {
+    box.innerHTML = '<div class="grid">' + items.map(cardHTML).join('') + '</div>';
+  } else {
+    box.innerHTML = tableHTML(items);
+  }
+  box.querySelectorAll('[data-key]').forEach(el =>
+    el.addEventListener('click', () => openDetail(el.dataset.key)));
+
+  $('#pager').innerHTML = pages > 1
+    ? `<button ${page <= 1 ? 'disabled' : ''} id="prev">← Previous</button>
+       <span class="count">${page} / ${pages}</span>
+       <button ${page >= pages ? 'disabled' : ''} id="next">Next →</button>` : '';
+  if ($('#prev')) $('#prev').onclick = () => { state.page--; load(); scrollTo(0, 0); };
+  if ($('#next')) $('#next').onclick = () => { state.page++; load(); scrollTo(0, 0); };
+}
+
+function cardHTML(it) {
+  const src = thumbSrc(it, 400);
+  const cut = it.compare_at_price && it.price && it.compare_at_price > it.price;
+  return `<button class="card" data-key="${esc(it.key)}">
+    <div class="thumb">${src
+      ? `<img loading="lazy" src="${esc(src)}" alt="${esc(it.name)}"
+             onerror="this.replaceWith(Object.assign(document.createElement('span'),
+                      {className:'none',textContent:'no image'}))">`
+      : '<span class="none">no image</span>'}</div>
+    <div class="body">
+      <div class="nm">${esc(it.name)}</div>
+      <div class="meta">
+        <span class="tag cat">${esc(it.design_category || 'unclassified')}</span>
+        <span class="tag">${esc(it.source)}</span>
+        ${it.availability !== 'in_stock'
+          ? `<span class="tag warn">${esc(it.availability.replace('_', ' '))}</span>` : ''}
+      </div>
+      <div class="price">${money(it.price, it.currency)}
+        ${cut ? `<span class="strike">${money(it.compare_at_price, it.currency)}</span>` : ''}
+        <small>${esc(it.price_unit || '')}</small></div>
+    </div></button>`;
+}
+
+const COLS = [
+  ['name', 'Product', r => esc(r.name), 'wide'],
+  ['source', 'Source', r => esc(r.source)],
+  ['brand', 'Brand', r => esc(r.brand || '—')],
+  ['design_category', 'Category', r => esc(r.design_category || '—')],
+  ['price', 'Price', r => money(r.price, r.currency), 'num'],
+  ['price_unit', 'Unit', r => esc(r.price_unit || '—')],
+  ['availability', 'Stock', r => esc((r.availability || '').replace('_', ' '))],
+  ['sku', 'SKU', r => esc(r.sku || '—')],
+  ['dims', 'Size', r => esc((r.dimension_text || []).join('; ') || '—'), 'wide'],
+  ['colors', 'Colour', r => esc((r.colors || []).join(', ') || '—')],
+  ['materials', 'Material', r => esc((r.materials || []).join(', ') || '—'), 'wide'],
+  ['image_count', 'Images', r => r.image_count, 'num'],
+  ['rating', 'Rating', r => r.rating == null ? '—' : `${r.rating} (${r.review_count || 0})`, 'num'],
+];
+
+function tableHTML(items) {
+  return `<div class="tablewrap"><table>
+    <thead><tr>${COLS.map(c => `<th>${c[1]}</th>`).join('')}</tr></thead>
+    <tbody>${items.map(r => `<tr data-key="${esc(r.key)}">`
+      + COLS.map(c => `<td class="${c[3] || ''}">${c[2](r)}</td>`).join('')
+      + '</tr>').join('')}</tbody></table></div>`;
+}
+
+// ---- detail -------------------------------------------------------------
+function kv(rows) {
+  const body = rows.filter(r => r[1] !== undefined && r[1] !== null && r[1] !== '' &&
+                                !(Array.isArray(r[1]) && !r[1].length))
+    .map(r => `<tr><th>${esc(r[0])}</th><td>${r[2] ? r[1] : esc(r[1])}</td></tr>`).join('');
+  return body ? `<table class="kv"><tbody>${body}</tbody></table>` : '';
+}
+
+async function openDetail(key) {
+  $('#scrim').classList.add('on');
+  $('#drawer').classList.add('on');
+  $('#d-body').innerHTML = '<div class="empty">Loading…</div>';
+  const p = await (await fetch('/api/product?key=' + encodeURIComponent(key))).json();
+  $('#d-title').textContent = p.name || key;
+
+  const imgs = (p.images || []).map(i => {
+    const src = i.sha256 ? `/api/image?sha=${i.sha256}&w=600` : i.url;
+    return `<img loading="lazy" src="${esc(src)}" alt="${esc(i.alt || '')}"
+                 title="${esc([i.role, i.width && `${i.width}×${i.height}`]
+                        .filter(Boolean).join(' · '))}">`;
+  }).join('');
+
+  const dims = Object.entries(p.dimensions || {})
+    .map(([k, v]) => `${k.replace('_mm', '')}: ${v} mm`).join(' · ');
+
+  const variants = (p.variants || []).length ? `<h3>Variants</h3><div class="tablewrap"><table>
+    <thead><tr><th>Variant</th><th>SKU</th><th>Price</th><th>Stock</th><th>Qty</th><th>Bulk pricing</th></tr></thead>
+    <tbody>${p.variants.map(v => `<tr>
+      <td>${esc(v.title || v.variant_id)}</td><td>${esc(v.sku || '—')}</td>
+      <td class="num">${money(v.price, p.currency)}</td>
+      <td>${v.available == null ? '—' : (v.available ? 'yes' : 'no')}</td>
+      <td class="num">${v.quantity ?? '—'}</td>
+      <td>${(v.bulk_pricing || []).map(b => `${b.quantity}+ → ${money(b.price, p.currency)}`)
+            .join(', ') || '—'}</td></tr>`).join('')}</tbody></table></div>` : '';
+
+  const history = (p.price_history || []).length > 1 ? `<h3>Price history</h3><div class="tablewrap"><table>
+    <thead><tr><th>Observed</th><th>Price</th><th>Availability</th></tr></thead>
+    <tbody>${p.price_history.map(h => `<tr><td>${esc(h.observed_at)}</td>
+      <td class="num">${money(h.price, p.currency)}</td>
+      <td>${esc(h.availability || '')}</td></tr>`).join('')}</tbody></table></div>` : '';
+
+  const emb = (p.embeddings || []).map(e => `${e.kind} ×${e.n} (${e.dim}-d, ${e.model})`).join('<br>');
+
+  $('#d-body').innerHTML = `
+    ${imgs ? `<div class="gallery">${imgs}</div>` : ''}
+    ${kv([
+      ['Price', `${money(p.price, p.currency)} ${esc(p.price_unit || '')}` +
+        (p.compare_at_price ? ` <span class="strike">${money(p.compare_at_price, p.currency)}</span>` : ''), true],
+      ['Availability', (p.availability || '').replace('_', ' ')],
+      ['Source', `${esc(p.source)} · <a href="${esc(p.url)}" target="_blank" rel="noopener">open product page ↗</a>`, true],
+      ['Brand', p.brand], ['Product type', p.product_type],
+      ['Design category', p.design_category], ['Site category', p.category],
+      ['Category path', (p.category_path || []).join(' › ')],
+      ['SKU', p.sku], ['Item no', p.item_no], ['Key', p.key],
+      ['Dimensions', dims], ['Stated size', (p.dimension_text || []).join('; ')],
+      ['Weight', p.weight_kg ? p.weight_kg + ' kg' : ''],
+      ['Materials', (p.materials || []).join(', ')],
+      ['Colours', (p.colors || []).join(', ')],
+      ['Tags', (p.tags || []).join(', ')],
+      ['Rating', p.rating == null ? '' : `${p.rating} from ${p.review_count || 0} reviews`],
+      ['Embeddings', emb || 'none yet', true],
+      ['First seen', p.first_seen], ['Last seen', p.last_seen],
+    ])}
+    ${variants}${history}
+    ${p.description ? `<h3>Description</h3><div class="desc">${esc(p.description)}</div>` : ''}
+    <h3>Everything stored</h3>
+    <details><summary>Attributes (source-specific fields)</summary>
+      <pre>${esc(JSON.stringify(p.attributes, null, 2))}</pre></details>
+    <details><summary>Raw payload as scraped</summary>
+      <pre>${esc(JSON.stringify(p.raw, null, 2))}</pre></details>`;
+}
+
+function closeDetail() {
+  $('#scrim').classList.remove('on');
+  $('#drawer').classList.remove('on');
+}
+
+// ---- wiring -------------------------------------------------------------
+let timer;
+function refresh(resetPage = true) {
+  if (resetPage) state.page = 1;
+  clearTimeout(timer);
+  timer = setTimeout(load, 120);
+}
+FILTERS.forEach(k => $('#' + k).addEventListener('input', () => refresh()));
+TOGGLES.forEach(k => $('#' + k).addEventListener('change', () => refresh()));
+$('#reset').onclick = () => {
+  FILTERS.forEach(k => $('#' + k).value = k === 'sort' ? 'name' : '');
+  TOGGLES.forEach(k => $('#' + k).checked = false);
+  refresh();
+};
+$('#view-grid').onclick = () => setView('grid');
+$('#view-table').onclick = () => setView('table');
+function setView(v) {
+  state.view = v;
+  $('#view-grid').setAttribute('aria-pressed', v === 'grid');
+  $('#view-table').setAttribute('aria-pressed', v === 'table');
+  load();
+}
+$('#scrim').onclick = closeDetail;
+$('#d-close').onclick = closeDetail;
+addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeDetail();
+  if (e.key === '/' && document.activeElement.tagName !== 'INPUT') { e.preventDefault(); $('#q').focus(); }
+});
+
+function fill(id, rows) {
+  $('#' + id).insertAdjacentHTML('beforeend', rows
+    .map(r => `<option value="${esc(r.value)}">${esc(r.value)} (${r.n})</option>`).join(''));
+}
+
+(async function init() {
+  const [s, f] = await Promise.all([
+    fetch('/api/summary').then(r => r.json()),
+    fetch('/api/facets').then(r => r.json()),
+  ]);
+  $('#engine').textContent = s.engine;
+  $('#chips').innerHTML = [
+    ['products', s.products], ['images', s.images],
+    ['downloaded', s.images_downloaded], ['embeddings', s.embeddings],
+    ['priced', s.priced], ['price points', s.price_observations],
+  ].map(([k, v]) => `<span class="chip">${k} <b>${(v ?? 0).toLocaleString('en-IN')}</b></span>`).join('')
+    + `<span class="chip" title="${esc(s.database)}">last crawl <b>${
+        esc((s.last_crawl || '—').slice(0, 16).replace('T', ' '))}</b></span>`
+    + (s.last_run ? `<span class="chip" title="${
+        esc(`${s.last_run.products_new} new, ${s.last_run.products_changed} changed, ${
+             s.last_run.price_changes} reprices`)}">last refresh <b>${
+        esc(s.last_run.status)}</b></span>` : '');
+  const runs = await fetch('/api/runs').then(r => r.json());
+  $('#runs').innerHTML = runs.length ? runs.map(r => `<div class="run">
+      <span class="dot ${r.status === 'ok' ? '' : 'bad'}"></span>
+      <b>${esc(r.started_at.slice(0, 16).replace('T', ' '))}</b> · ${esc(r.source)}<br>
+      ${r.products_new} new · ${r.products_changed} changed · ${r.price_changes} reprices
+      · ${r.pages_failed ? `<span class="bad">${r.pages_failed} failed</span>` : 'no failures'}
+      ${r.error ? `<br><span class="bad">${esc(r.error)}</span>` : ''}
+    </div>`).join('')
+    : '<div class="run">No refresh has run yet. Schedule one with '
+      + '<code>python3 -m catalog schedule install</code>.</div>';
+
+  fill('source', f.sources);
+  fill('category', f.categories);
+  fill('brand', f.brands);
+  fill('availability', f.availability);
+  load();
+})();
+</script>
+</body>
+</html>

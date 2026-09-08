@@ -119,6 +119,23 @@ CREATE TABLE IF NOT EXISTS embeddings (
     PRIMARY KEY (product_key, kind, ref, model)
 );
 
+CREATE TABLE IF NOT EXISTS crawl_runs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    source       TEXT NOT NULL,
+    started_at   TEXT NOT NULL,
+    finished_at  TEXT,
+    status       TEXT NOT NULL DEFAULT 'running',
+    pages_ok     INTEGER DEFAULT 0,
+    pages_failed INTEGER DEFAULT 0,
+    products_new INTEGER DEFAULT 0,
+    products_changed INTEGER DEFAULT 0,
+    price_changes    INTEGER DEFAULT 0,
+    images_downloaded INTEGER DEFAULT 0,
+    embeddings_added  INTEGER DEFAULT 0,
+    error        TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_runs_started ON crawl_runs(started_at DESC);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS products_fts USING fts5(
     key UNINDEXED, name, brand, category_path, description, materials, colors, tags,
     tokenize='porter unicode61'
@@ -219,6 +236,18 @@ def upsert(conn: sqlite3.Connection, products: Iterable[Product]) -> dict[str, i
         conn.execute(_UPSERT_SQL, [values[c] for c in _PRODUCT_COLS])
 
         # Images and variants are replaced wholesale; they are small and ordered.
+        # Carry the downloaded file across by URL first: positions shift whenever a
+        # retailer adds a shot, and dropping local_path would re-download the whole
+        # catalogue on every crawl.
+        on_disk = {
+            r["url"]: (r["local_path"], r["sha256"])
+            for r in conn.execute(
+                "SELECT url, local_path, sha256 FROM product_images "
+                "WHERE product_key=? AND local_path IS NOT NULL", (p.key,))
+        }
+        for img in p.images:
+            if img.local_path is None and img.url in on_disk:
+                img.local_path, img.sha256 = on_disk[img.url]
         conn.execute("DELETE FROM product_images WHERE product_key=?", (p.key,))
         conn.executemany(
             "INSERT OR REPLACE INTO product_images "
@@ -298,4 +327,8 @@ def stats(conn: sqlite3.Connection) -> dict[str, Any]:
             "GROUP BY design_category ORDER BY c DESC")},
         "priced": conn.execute(
             "SELECT COUNT(*) c FROM products WHERE price IS NOT NULL").fetchone()["c"],
+        "last_run": (lambda r: dict(r) if r else None)(conn.execute(
+            "SELECT source, started_at, finished_at, status, products_new, "
+            "products_changed, price_changes FROM crawl_runs "
+            "ORDER BY started_at DESC LIMIT 1").fetchone()),
     }

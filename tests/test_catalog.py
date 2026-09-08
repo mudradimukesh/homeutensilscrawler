@@ -16,6 +16,7 @@ from catalog.models import (
     parse_length_mm, parse_weight_kg,
 )
 from catalog.search import find_products, label_confidence, price_design
+from catalog.web import Catalog, _fts_match
 from catalog.sources.homerun import _flight_rows, _take_text_row
 
 
@@ -98,6 +99,68 @@ def test_upsert_and_price_history(tmp_path=None):
     db.unlink(missing_ok=True)
 
 
+def test_recrawl_keeps_downloaded_images(tmp_path="/tmp"):
+    db = Path(tmp_path) / "images_keep.db"
+    db.unlink(missing_ok=True)
+    conn = store.connect(db)
+    store.upsert(conn, [_product()])
+    conn.execute("UPDATE product_images SET local_path='/tmp/x.jpg', sha256='abc'")
+    conn.commit()
+
+    changed = _product(price=150.0)                      # a reprice, same photograph
+    changed.images.insert(0, Image(url="https://img.test/new.jpg", position=0))
+    changed.images[1].position = 1
+    store.upsert(conn, [changed])
+
+    rows = {r["url"]: r["local_path"] for r in
+            conn.execute("SELECT url, local_path FROM product_images")}
+    assert rows["https://img.test/p1.jpg"] == "/tmp/x.jpg", "known file must survive a re-crawl"
+    assert rows["https://img.test/new.jpg"] is None
+    db.unlink(missing_ok=True)
+
+
+def test_refresh_reports_a_price_move(tmp_path="/tmp"):
+    from catalog.refresh import _price_changes_since
+
+    db = Path(tmp_path) / "refresh_prices.db"
+    db.unlink(missing_ok=True)
+    conn = store.connect(db)
+    store.upsert(conn, [_product(price=355.0)])          # yesterday's crawl
+    window = "2000-01-01T00:00:00+00:00"
+    assert _price_changes_since(conn, window) == []      # a first sighting is not a change
+
+    store.upsert(conn, [_product(price=395.0)])          # today: the site repriced
+    moves = _price_changes_since(conn, window)
+    assert len(moves) == 1
+    assert (moves[0]["prev"], moves[0]["price"]) == (355.0, 395.0)
+
+    store.upsert(conn, [_product(price=395.0)])          # unchanged: no new observation
+    assert len(_price_changes_since(conn, window)) == 1
+    db.unlink(missing_ok=True)
+
+
+def test_duration_parsing():
+    from catalog.refresh import parse_duration
+    assert parse_duration("45m") == 2700
+    assert parse_duration("12h") == 43200
+    assert parse_duration("3d") == 259200
+    assert parse_duration("0") == 0
+
+
+def test_refresh_lock_is_exclusive(tmp_path="/tmp"):
+    from catalog.refresh import Lock
+    path = Path(tmp_path) / "lock.test"
+    path.unlink(missing_ok=True)
+    with Lock(path):
+        assert path.exists()
+        try:
+            with Lock(path):
+                raise AssertionError("a second refresh must not start")
+        except SystemExit:
+            pass
+    assert not path.exists(), "the lock is released on exit"
+
+
 def test_content_hash_covers_derived_fields():
     a, b = _product(), _product()
     b.design_category = "chair"
@@ -140,6 +203,24 @@ def test_confidence_floor_rejects_a_nonsense_match(tmp_path="/tmp"):
     assert line["matched"] is None, "a spot light box is not a brass chandelier"
     assert quote["items_low_confidence"] == 1
     assert line["alternates"], "rejected candidates are still offered for review"
+
+
+def test_web_search_uses_fts_without_an_alias(tmp_path="/tmp"):
+    # FTS5 resolves MATCH and bm25() against the table name; an alias raises
+    # "no such column", which the browser only saw as an empty result.
+    conn = _seeded(tmp_path)
+    web = Catalog(Path(tmp_path) / "search.db", Path(tmp_path))
+    web._local.conn = conn
+    out = web.products({"q": ["sofa grey"]})
+    assert out["total"] >= 1
+    assert out["items"][0]["name"].startswith("KIVIK")
+    assert web.products({"q": ["sofa"], "max_price": ["30000"]})["total"] == 1
+
+
+def test_fts_match_drops_stopwords():
+    assert _fts_match("a white pendant lamp for the ceiling") == \
+        '"white" OR "pendant" OR "lamp" OR "ceiling"'
+    assert _fts_match("the of and") is None
 
 
 def test_confidence_scoring():

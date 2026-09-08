@@ -88,6 +88,40 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--pretrained", default=DEFAULT_PRETRAINED)
 
+    p = sub.add_parser("refresh", help="one scheduled-refresh cycle: crawl, load, images, embed")
+    p.add_argument("--sources", default="all")
+    p.add_argument("--stale-after", default="0",
+                   help="reuse a cached page younger than this (e.g. 6h); 0 always refetches")
+    p.add_argument("--delay", type=float, default=1.0)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--limit", type=int)
+    p.add_argument("--skip-images", action="store_true")
+    p.add_argument("--skip-embed", action="store_true")
+    p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("watch", help="run refresh on a loop (containers; prefer `schedule` on macOS)")
+    p.add_argument("--every", default="24h")
+    p.add_argument("--sources", default="all")
+    p.add_argument("--stale-after", default="0")
+    p.add_argument("--delay", type=float, default=1.0)
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--limit", type=int)
+    p.add_argument("--skip-images", action="store_true")
+    p.add_argument("--skip-embed", action="store_true")
+
+    p = sub.add_parser("schedule", help="install the refresh as a daily background job")
+    p.add_argument("action", choices=["install", "uninstall", "status"])
+    p.add_argument("--at", default="03:30", help="local time of day, HH:MM")
+    p.add_argument("--stale-after", default="0")
+    p.add_argument("--skip-embed", action="store_true")
+    p.add_argument("--print-only", action="store_true",
+                   help="print the job definition instead of installing it")
+
+    p = sub.add_parser("web", help="browse the catalogue in a browser")
+    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--images", default=str(DEFAULT_IMAGES))
+
     sub.add_parser("stats", help="what is in the database")
 
     args = ap.parse_args(argv)
@@ -169,6 +203,40 @@ def main(argv: list[str] | None = None) -> int:
             in_stock_only=not args.allow_out_of_stock, alternates=args.alternates,
             min_confidence=args.min_confidence,
         )))
+        return 0
+
+    if args.cmd in ("refresh", "watch"):
+        from .refresh import format_report, parse_duration, refresh, watch
+        names = None if args.sources == "all" else args.sources.split(",")
+        opts = dict(
+            db_path=args.db, data_dir=DATA, sources=names,
+            stale_after=parse_duration(args.stale_after), delay=args.delay,
+            workers=args.workers, limit=args.limit,
+            skip_images=args.skip_images, skip_embed=args.skip_embed,
+        )
+        if args.cmd == "watch":
+            watch(parse_duration(args.every), **opts)
+            return 0
+        report = refresh(**opts)
+        print(dump(report) if args.json else format_report(report))
+        return 0 if report["status"] == "ok" else 1
+
+    if args.cmd == "schedule":
+        from . import schedule as sched
+        if args.action == "uninstall":
+            return sched.uninstall()
+        if args.action == "status":
+            return sched.status(args.db)
+        hour, _, minute = args.at.partition(":")
+        extra = ["--stale-after", args.stale_after]
+        if args.skip_embed:
+            extra.append("--skip-embed")
+        return sched.install(ROOT, int(hour), int(minute or 0), extra,
+                             print_only=args.print_only)
+
+    if args.cmd == "web":
+        from .web import serve
+        serve(args.db, args.images, host=args.host, port=args.port)
         return 0
 
     if args.cmd == "stats":
