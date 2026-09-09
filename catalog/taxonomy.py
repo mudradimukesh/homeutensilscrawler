@@ -165,6 +165,10 @@ _PRIORITY_RULES: list[tuple[str, str]] = sorted(
         ("lid for", "components"), ("add on", "components"),
         ("seat shell", "components"), ("finials", "curtains"),
         ("bedroom furniture", "beds"), ("wash stand", "bathroom"),
+        # A fitting, bracket or mechanism is a part, whatever it is a part of.
+        ("bed fitting", "hardware"), ("bed fittings", "hardware"),
+        ("sofa fitting", "hardware"), ("lift mechanism", "hardware"),
+        ("gas pump", "hardware"), ("bed hydraulic", "hardware"),
     ],
     key=lambda kv: -len(kv[0]),
 )

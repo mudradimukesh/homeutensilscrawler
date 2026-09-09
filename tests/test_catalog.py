@@ -256,6 +256,80 @@ def test_plan_emits_every_url_when_unlimited():
     assert sorted(out) == sorted(urls), "stratifying must not drop or duplicate URLs"
 
 
+# -- material specifications -----------------------------------------------
+def test_a_size_range_is_not_a_measurement():
+    from catalog.specs import size_range
+    # "200mm to 700mm" lists the sizes a channel is sold in. Reading it as a
+    # length recorded 200 mm as fact and broke every dimensional filter on it.
+    assert size_range("Telescopic Channel, 200mm to 700mm") == (200.0, 700.0)
+    assert size_range("Channel 450-600 mm") == (450.0, 600.0)
+    assert size_range("18mm Plywood") is None
+
+
+def test_a_unit_ends_where_the_word_ends():
+    from catalog.specs import size_range
+    # The "m" alternative matched the m of "minutes" and turned an adhesive's
+    # cure time into a 30-60 metre fitting.
+    assert size_range("cure time 30 to 60 minutes") is None
+    assert size_range("set in 5-10 min") is None
+    assert size_range("coverage 30 to 60 sq ft") is None
+
+
+def test_only_sheet_goods_have_a_sheet_size():
+    from catalog.specs import extract
+    # Every "105x57x200 cm" furniture dimension matched before this: 8,300 of
+    # 13,172 products claimed a sheet size.
+    ply = _product("s1", 1974.0, "Century BWP Marine Plywood 8 x 4 ft")
+    assert extract(ply)["sheet_size_mm"] == [2438, 1219]
+    sofa = _product("s2", 24990.0, "VIHALS Wardrobe - white 105x57x200 cm")
+    assert "sheet_size_mm" not in extract(sofa)
+
+
+def test_a_load_rating_is_not_a_pack_size():
+    from catalog.specs import extract, units
+    p = _product("h1", 295.0, "Hettich KA 5632 Telescopic Channel, 45 kg Capacity, 200mm to 700mm")
+    assert extract(p)["load_capacity_kg"] == 45.0
+    u = units(p)
+    # A channel is sold by the piece. Recording a 45 kg pack would make any
+    # quantity take-off nonsense.
+    assert u["pack_quantity"] is None
+    assert u["purchase_unit"] == "piece"
+
+
+def test_units_separate_cost_content_and_consumption():
+    from catalog.specs import units
+    glue = _product("a1", 6300.0, "Pidilite Masterlok Synthetic Wood Adhesive, 50Kg")
+    u = units(glue)
+    assert (u["purchase_unit"], u["pack_quantity"], u["pack_uom"]) == ("kg", 50.0, "kg")
+    ply = _product("a2", 1974.0, "Century Club Prime BWP Marine Plywood")
+    assert units(ply)["purchase_unit"] == "sheet"
+    assert units(ply)["consumption_uom"] == "sq_ft", "sheet goods are consumed by area"
+
+
+def test_grade_is_extracted_for_sheet_goods():
+    from catalog.specs import extract
+    p = _product("g1", 1974.0, "Century Club Prime BWP Marine Plywood")
+    p.description = "premium boiling water proof BWP grade conforming to IS:710"
+    got = extract(p)["grade"]
+    assert "BWP" in got and "IS:710" in got
+
+
+def test_an_unknown_product_is_not_assumed_to_be_furniture():
+    from catalog.quality import geometry_for
+    # Defaulting to `footprint` asserted that plywood and adhesive stand on the
+    # floor and merely lacked measurements.
+    assert geometry_for(None) == "none"
+    assert geometry_for("something-new") == "none"
+    assert geometry_for("beds") == "footprint"
+
+
+def test_a_fitting_is_hardware_whatever_it_fits():
+    from catalog.taxonomy import classify_text
+    assert classify_text("Ebco Pro Lift Bed Fitting - Extended Arm Set") == "hardware"
+    assert classify_text("Ebco Pro Lift Bed Hydraulic Gas Pump") == "hardware"
+    assert classify_text("MALM Bed frame - white 160x200 cm") == "beds"
+
+
 # -- search index consistency ----------------------------------------------
 def test_fts_follows_products_through_every_write(tmp_path="/tmp"):
     db = Path(tmp_path) / "fts_triggers.db"

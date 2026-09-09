@@ -196,6 +196,15 @@ class CatalogService:
             "dimensions_mm": _dims(row["dimensions"]),
             "stated_size": _loads(row["dimension_text"], []),
             "weight_kg": row["weight_kg"],
+            # What a build needs and a finished product never does: the grade,
+            # thickness and sheet size of a material, the load a fitting takes,
+            # the sizes it comes in — and the difference between what a unit
+            # costs, what it contains, and how it gets consumed.
+            "specifications": _loads(row["specs"], {}),
+            "purchase_unit": row["purchase_unit"],
+            "pack_quantity": row["pack_quantity"],
+            "pack_uom": row["pack_uom"],
+            "consumption_uom": row["consumption_uom"],
             "materials": _loads(row["materials"], []),
             "colors": _loads(row["colors"], []),
             "placement_geometry": row["placement_geometry"],

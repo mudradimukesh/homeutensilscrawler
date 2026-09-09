@@ -17,6 +17,7 @@ from ..models import (
     Image, Product, Variant, axis_for, classify_design_category,
     parse_length_mm, parse_weight_kg,
 )
+from ..specs import size_range
 from .base import Source, sitemap_locs
 
 log = logging.getLogger(__name__)
@@ -291,7 +292,14 @@ class HomeRun(Source):
         # ---- dimensions -------------------------------------------------
         dims: dict[str, float] = {}
         dim_text: list[str] = []
+        # "Telescopic Channel, 200mm to 700mm" lists the sizes it is sold in.
+        # Treating that as a measurement recorded 200 mm as the product's length
+        # and made every dimensional filter on it wrong; the range is a spec.
+        stated_range = size_range(title)
         for token in re.findall(r"[^,|(]*\b\d+(?:\.\d+)?\s*(?:mm|cm|m|ft|inch|in)\b[^,|)]*", title, re.I):
+            if stated_range and re.search(r"\b(?:to|[-–—])\b|\d\s*[-–—]\s*\d", token):
+                dim_text.append(token.strip())
+                continue
             token = token.strip()
             if not token:
                 continue

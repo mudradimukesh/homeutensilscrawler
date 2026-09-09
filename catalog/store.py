@@ -20,10 +20,11 @@ from typing import Any, Iterable
 from .family import FAMILY_COLUMNS, resolve as resolve_family
 from .models import Product
 from .quality import QUALITY_COLUMNS, assess
+from .specs import SPEC_COLUMNS, extract as extract_specs, units as extract_units
 
 # Everything derived on write, and therefore everything a migration must add to
 # a database created before these existed.
-DERIVED_COLUMNS = {**QUALITY_COLUMNS, **FAMILY_COLUMNS}
+DERIVED_COLUMNS = {**QUALITY_COLUMNS, **FAMILY_COLUMNS, **SPEC_COLUMNS}
 
 log = logging.getLogger(__name__)
 
@@ -123,7 +124,15 @@ CREATE TABLE IF NOT EXISTS products (
     -- SKUs and one piece of furniture; retrieval collapses on this.
     family_key              TEXT,
     family_label            TEXT,
-    variant_label           TEXT
+    variant_label           TEXT,
+    -- What a builder needs that a finished product never does: thickness, sheet
+    -- size, grade, load rating, and the difference between what a unit costs,
+    -- what it contains, and how it is consumed.
+    specs                   TEXT,
+    purchase_unit           TEXT,
+    pack_quantity           REAL,
+    pack_uom                TEXT,
+    consumption_uom         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_products_design  ON products(design_category);
 CREATE INDEX IF NOT EXISTS idx_products_source  ON products(source);
@@ -366,6 +375,10 @@ def _content_hash(p: Product) -> str:
         p.price_unit, p.sku, p.description, p.materials, p.colors, p.tags,
         p.dimensions, p.weight_kg, [i.url for i in p.images], p.category_path,
         p.category, p.product_type, p.design_category, p.rating, resolve_family(p)[0],
+        # Derived specs and units belong in the hash too: without them an
+        # improved extractor would be discarded as "unchanged", exactly as a
+        # retuned taxonomy once was.
+        extract_specs(p), extract_units(p),
         [(v.variant_id, v.price, v.available, v.quantity) for v in p.variants],
     ])
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
@@ -419,6 +432,9 @@ def upsert(conn: sqlite3.Connection, products: Iterable[Product]) -> dict[str, i
         family_key, family_label, variant_label = resolve_family(p)
         values.update(family_key=family_key, family_label=family_label,
                       variant_label=variant_label)
+
+        values["specs"] = _j(extract_specs(p))
+        values.update(extract_units(p))
         # A real upsert, not INSERT OR REPLACE: REPLACE deletes the existing row
         # first, and the ON DELETE CASCADE on price_history would take the whole
         # price series with it every time a product was re-crawled.

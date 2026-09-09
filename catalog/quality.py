@@ -61,7 +61,14 @@ MIN_RENDER_PX = 1000        # long edge that survives being composited into a ro
 
 
 def geometry_for(design_category: str | None) -> str:
-    return CATEGORY_GEOMETRY.get(design_category or "", "footprint")
+    """Placement geometry for a category, defaulting to "not placed".
+
+    Defaulting an unrecognised product to `footprint` asserted that plywood,
+    adhesive and bed fittings stand on the floor and merely lacked measurements.
+    "We do not know what this is" must not read as "assume it is furniture" —
+    excluding an unknown from placement is recoverable, placing one is not.
+    """
+    return CATEGORY_GEOMETRY.get(design_category or "", "none")
 
 
 def _axis_present(dims: dict, options: tuple[str, ...]) -> bool:
