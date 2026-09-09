@@ -12,6 +12,7 @@ import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from .budget import DiskBudget, human
@@ -35,6 +36,46 @@ def _extension(url: str, blob: bytes) -> str:
     return ".jpg"
 
 
+def prune_unreferenced(
+    conn: sqlite3.Connection, image_dir: str | Path, dry_run: bool = True
+) -> dict[str, Any]:
+    """Delete image files no product row points at.
+
+    Files are content-addressed, so a file is only genuinely stranded once the
+    catalogue has stopped wanting it — a download interrupted before its rows
+    were committed looks identical to one that has been abandoned. Run this
+    after an image pass has completed, never during one, and it is dry by
+    default because the only signal that a file is wanted lives in the database.
+    """
+    image_dir = Path(image_dir)
+    referenced = {
+        Path(r["local_path"]).resolve()
+        for r in conn.execute(
+            "SELECT local_path FROM product_images WHERE local_path IS NOT NULL")
+        if r["local_path"]
+    }
+    stranded, freed = [], 0
+    for path in image_dir.rglob("*"):
+        if not path.is_file() or path.resolve() in referenced:
+            continue
+        stranded.append(path)
+        freed += path.stat().st_size
+
+    if not dry_run:
+        for path in stranded:
+            path.unlink(missing_ok=True)
+        for d in sorted(image_dir.rglob("*"), reverse=True):
+            if d.is_dir() and not any(d.iterdir()):
+                d.rmdir()
+
+    return {
+        "referenced": len(referenced),
+        "stranded": len(stranded),
+        "bytes_freed": freed,
+        "deleted": not dry_run,
+    }
+
+
 def download_missing(
     conn: sqlite3.Connection,
     fetcher: Fetcher,
@@ -43,6 +84,7 @@ def download_missing(
     per_product: int | None = None,
     workers: int = 4,
     budget: DiskBudget | None = None,
+    commit_every: int = 200,
 ) -> dict[str, int]:
     """Fetch every image row that has no local file yet.
 
@@ -85,6 +127,10 @@ def download_missing(
                 budget.add(len(blob))
         return row, path, (digest, existed)
 
+    # Committed in batches. A single transaction around 37k downloads means a
+    # run killed at hour nine records nothing: the files are on disk, the
+    # database has never heard of them, and the next run re-fetches every byte.
+    done = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for row, path, meta in pool.map(work, rows):
             if meta == "stopped":
@@ -100,6 +146,12 @@ def download_missing(
                 "WHERE product_key=? AND position=?",
                 (str(path), digest, row["product_key"], row["position"]),
             )
+            done += 1
+            if done % commit_every == 0:
+                conn.commit()
+                log.info("images %d/%d  downloaded=%d deduped=%d failed=%d",
+                         done, len(rows), counts["downloaded"], counts["deduped"],
+                         counts["failed"])
     conn.commit()
     if counts["stopped"] and budget is not None:
         log.warning("image download stopped at %s of %s; %d images still pending",

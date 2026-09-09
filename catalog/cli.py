@@ -25,6 +25,12 @@ DEFAULT_CACHE = DATA / "cache"
 DEFAULT_IMAGES = DATA / "images"
 
 
+def _images_running() -> bool:
+    import subprocess
+    out = subprocess.run(["pgrep", "-f", "catalog images"], capture_output=True)
+    return out.returncode == 0
+
+
 def _weights(path: str | None) -> dict[str, int] | None:
     """Category weights from a JSON file, merged over the defaults."""
     if not path:
@@ -74,6 +80,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-data-size", default="1GB",
                    help="stop when data/ reaches this size (default 1GB; 0 = no limit)")
 
+
+    p = sub.add_parser("prune-images", help="delete image files no product points at")
+    p.add_argument("--dir", default=str(DEFAULT_IMAGES))
+    p.add_argument("--delete", action="store_true",
+                   help="actually delete; without this it only reports")
 
     p = sub.add_parser("embed", help="compute CLIP embeddings")
     p.add_argument("--text-only", action="store_true")
@@ -233,6 +244,22 @@ def main(argv: list[str] | None = None) -> int:
         print(dump(got))
         print(disk_report(budget.breakdown()))
         return 2 if got.get("stopped") else 0
+
+    if args.cmd == "prune-images":
+        from .budget import human
+        from .images import prune_unreferenced
+        conn = store.connect(args.db)
+        if not args.delete and _images_running():
+            print("an image download is in progress — files it has not committed yet "
+                  "look stranded but are not. Wait for it to finish.", file=sys.stderr)
+        report = prune_unreferenced(conn, args.dir, dry_run=not args.delete)
+        verb = "deleted" if report["deleted"] else "would delete"
+        print(f"{report['referenced']:,} files referenced by the catalogue")
+        print(f"{verb} {report['stranded']:,} stranded files "
+              f"({human(report['bytes_freed'])})")
+        if not report["deleted"] and report["stranded"]:
+            print("re-run with --delete to remove them")
+        return 0
 
     if args.cmd == "embed":
         conn = store.connect(args.db)

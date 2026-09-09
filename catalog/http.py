@@ -203,20 +203,30 @@ class Fetcher:
                 backoff *= 2
         return None
 
-    def get_bytes(self, url: str) -> bytes | None:
-        """Binary fetch (images). Never cached as text; the image store is the cache."""
+    def get_bytes(self, url: str, timeout: float | None = None,
+                  retries: int | None = None) -> bytes | None:
+        """Binary fetch (images). Never cached as text; the image store is the cache.
+
+        Images get a shorter leash than pages. A CDN that is throttling stops
+        answering rather than refusing, so the default 30s timeout times three
+        attempts spends 90 seconds discovering one unavailable file — which is
+        how an image pass ends up slower than the crawl that produced it.
+        """
         if not self.allowed(url):
             return None
+        timeout = timeout or min(self.timeout, 12)
+        retries = retries if retries is not None else 2
         host = urlparse(url).netloc
-        for attempt in range(1, self.max_retries + 1):
+        for attempt in range(1, retries + 1):
             self.limiter.wait(host)
             try:
-                r = self.session.get(url, timeout=self.timeout)
+                r = self.session.get(url, timeout=timeout)
                 if r.status_code == 200:
                     return r.content
                 if r.status_code in (404, 410):
                     return None
             except requests.RequestException as exc:
-                log.warning("image %s: %s", url, exc)
-            time.sleep(1.5 * attempt)
+                log.debug("image %s: %s", url, exc)
+            if attempt < retries:
+                time.sleep(1.0 * attempt)
         return None
