@@ -25,6 +25,8 @@ from typing import Any, Iterable
 
 from . import store
 from .search import find_products, get_family
+from .custom_builds import normalize_builds, material_filter
+from .specs import variant_specs, PACK_NOUNS
 from .embed import Embedder
 from .quality import PRICE_TTL_DAYS, _is_current
 
@@ -88,9 +90,13 @@ class CatalogService:
     def _card(self, m) -> dict[str, Any]:
         """The compact form a model sees in a result list."""
         self._issue(m.key)
-        dims = self.conn.execute("SELECT dimensions FROM products WHERE key=?", (m.key,)).fetchone()
+        dims = self.conn.execute("SELECT dimensions,specs,purchase_unit,pack_quantity,pack_uom,consumption_uom FROM products WHERE key=?", (m.key,)).fetchone()
         return {
             "dimensions_mm": _dims(dims[0]),
+            "specifications": _loads(dims["specs"], {}),
+            "purchase_unit": dims["purchase_unit"],
+            "pack_quantity": dims["pack_quantity"], "pack_uom": dims["pack_uom"],
+            "consumption_uom": dims["consumption_uom"],
             "product_key": m.key,
             "name": m.name,
             "family": m.family_label,
@@ -123,6 +129,7 @@ class CatalogService:
         limit: int = 8,
         reference_image_id: str | None = None,
         render_ready_only: bool = False,
+        material_kind: str | None = None,
     ) -> dict[str, Any]:
         """Find products. Returns product keys the design may then use."""
         limit = max(1, min(int(limit or 8), MAX_RESULTS))
@@ -147,7 +154,7 @@ class CatalogService:
                 allow_store_only=self.allow_store_only, k=limit, embedder=embedder,
                 eligible_only=bool(placeable_only), collapse_families=bool(one_per_family),
                 max_width_mm=max_width_mm, max_depth_mm=max_depth_mm, max_height_mm=max_height_mm,
-                require_image_match=image_bytes is not None, render_ready_only=render_ready_only, fresh_only=True,
+                require_image_match=image_bytes is not None, render_ready_only=render_ready_only, fresh_only=True, material_kind=material_kind,
             )
         except (RuntimeError, ValueError, OSError) as exc:
             log.warning("catalog search failed: %s", exc)
@@ -213,6 +220,15 @@ class CatalogService:
             "images": images,
             "source_url": row["url"],
         }
+        purchase_variants = self.conn.execute(
+            "SELECT variant_id,title,sku,price,available,options FROM product_variants WHERE product_key=? ORDER BY variant_id", (product_key,)).fetchall()
+        out["purchase_variants"] = [{"variant_id": v["variant_id"], "title": v["title"], "sku": v["sku"],
+                                     "price": v["price"], "available": bool(v["available"]),
+                                     "options": _loads(v["options"], {}), "price_unit": row["price_unit"],
+                                     "purchase_unit": row["purchase_unit"],
+                                     "specifications": variant_specs(_loads(row["specs"], {}), v["title"], _loads(v["options"], {}), row["name"])} for v in purchase_variants]
+        for variant in purchase_variants:
+            self._issue("variant:" + json.dumps([product_key, variant["variant_id"]]))
         if include_variants and row["family_key"]:
             fam = get_family(self.conn, row["family_key"])
             out["family_variants"] = [
@@ -269,15 +285,18 @@ class CatalogService:
         return priced
 
     def save_manifest(self, objects: list[dict[str, Any]], *, budget: float | None = None,
-                      design_id: str | None = None) -> dict[str, Any]:
+                      design_id: str | None = None, custom_builds: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         """Application-only immutable selection, saved before spending on rendering."""
-        if not objects or len(objects) > 12:
-            raise ValueError("select between 1 and 12 product slots")
+        builds = normalize_builds([] if custom_builds is None else custom_builds)
+        if not isinstance(objects, list) or not 1 <= len(objects) + len(builds) <= 12:
+            raise ValueError("select between 1 and 12 furniture slots")
         if budget is not None and (isinstance(budget, bool) or not isinstance(budget, (int, float))
                                    or not math.isfinite(budget) or budget <= 0):
             raise ValueError("budget must be finite and positive")
         design_id = design_id or uuid.uuid4().hex
         request = {"objects": objects, "budget": budget}
+        if builds:
+            request["custom_builds"] = custom_builds
         existing = self.get_manifest(design_id)
         if existing:
             if existing["request"] != request:
@@ -286,9 +305,12 @@ class CatalogService:
         # The transaction pins product details, stock and prices to one database snapshot.
         with self.conn:
             self.conn.execute("BEGIN IMMEDIATE")
-            quote = self.price_design(objects)
+            quote = self.price_design(objects) if objects else self._price_by_key([])
+            quote.setdefault("complete", True)
             if not quote.get("complete"):
                 raise ValueError("invalid selection: " + json.dumps(quote.get("rejected_items", [])))
+            builds, material_quote = self._quote_builds(builds)
+            quote = self._combined_quote(quote, material_quote, bool(builds))
             if budget is not None and quote["subtotal"] > budget:
                 raise ValueError("selected products exceed the room budget")
             products, assets = [], {}
@@ -338,13 +360,65 @@ class CatalogService:
                     "availability": row["availability"], "observed_at": row["last_seen"],
                 })
             snapshot = {"design_id": design_id, "request": request, "products": products,
-                        "quote": quote, "budget": budget, "verification": None}
+                        "quote": quote, "budget": budget, "verification": None, "custom_builds": builds}
             self.conn.execute("INSERT INTO design_manifests VALUES (?,?,?,?,NULL)",
                               (design_id, self.session_id, datetime.now(timezone.utc).isoformat(),
                                json.dumps(snapshot, allow_nan=False)))
             self.conn.executemany("INSERT INTO design_assets VALUES (?,?,?)",
                                   [(design_id, asset, blob) for asset, blob in assets.items()])
         return snapshot
+
+    def _quote_builds(self, builds, *, strict=True):
+        subtotal, pending = 0.0, []
+        for build in builds:
+            for item in build["inputs"]:
+                key = item["product_key"]
+                item["product"] = None
+                item["line_total"] = None
+                if key is None:
+                    pending.append({"slot_id": build["slot_id"], "query": item["query"], "reason": "material not sourced"})
+                    continue
+                check = self.price_design([{"product_key": key, "quantity": 1}])
+                predicate, values = material_filter(item["role"])
+                row = self.conn.execute("SELECT * FROM products WHERE key=? AND " + predicate, [key] + values).fetchone()
+                variant_count = self.conn.execute("SELECT COUNT(*) FROM product_variants WHERE product_key=?", (key,)).fetchone()[0]
+                variant_id = item.get("variant_id")
+                variant = self.conn.execute("SELECT * FROM product_variants WHERE product_key=? AND variant_id=?", (key, variant_id)).fetchone() if variant_id else None
+                variant_ok = (variant_count == 0 and not variant_id) or (
+                    variant is not None and variant["available"] == 1
+                    and variant["price"] is not None and math.isfinite(variant["price"]) and variant["price"] >= 0
+                    and "variant:" + json.dumps([key, variant_id]) in self.issued)
+                if not check.get("complete") or row is None or not variant_ok:
+                    if strict:
+                        raise ValueError("material must be an issued, available, unambiguous catalog input: " + key)
+                    pending.append({"slot_id": build["slot_id"], "product_key": key, "reason": "material unavailable, ambiguous or no current price"})
+                    continue
+                unit_price = variant["price"] if variant is not None else row["price"]
+                purchase_unit = row["purchase_unit"] or row["price_unit"]
+                item["product"] = {"product_key": key, "variant_id": variant_id, "variant": variant["title"] if variant is not None else row["variant_label"],
+                                   "name": row["name"], "unit_price": unit_price,
+                                   "price_unit": row["price_unit"], "purchase_unit": purchase_unit,
+                                   "pack_quantity": row["pack_quantity"], "pack_uom": row["pack_uom"], "consumption_uom": row["consumption_uom"],
+                                   "specifications": variant_specs(_loads(row["specs"], {}), variant["title"], _loads(variant["options"], {}), row["name"]) if variant is not None else _loads(row["specs"], {}),
+                                   "currency": row["currency"], "source_url": row["url"],
+                                   "availability": row["availability"], "observed_at": row["last_seen"]}
+                if item["quantity"] is None or not purchase_unit or item["purchase_unit"] != purchase_unit:
+                    pending.append({"slot_id": build["slot_id"], "product_key": key, "reason": "quantity in catalog selling units needs confirmation"})
+                    continue
+                total_quantity = item["quantity"] * build["quantity"]
+                item["total_purchase_quantity"] = math.ceil(total_quantity) if purchase_unit in PACK_NOUNS else total_quantity
+                item["line_total"] = round(unit_price * item["total_purchase_quantity"], 2)
+                subtotal += item["line_total"]
+        return builds, {"subtotal": round(subtotal, 2), "pending": pending}
+
+    @staticmethod
+    def _combined_quote(ready, materials, has_custom):
+        return {**ready, "subtotal": round(ready["subtotal"] + materials["subtotal"], 2),
+                "ready_made_subtotal": ready["subtotal"], "materials_estimate_subtotal": materials["subtotal"],
+                "pending_materials": materials["pending"],
+                "complete": ready.get("complete", False) and not materials["pending"],
+                "cost_complete": ready.get("complete", False) and not has_custom,
+                "labour_included": False, "carpenter_review_required": has_custom}
 
     def get_manifest(self, design_id: str) -> dict[str, Any] | None:
         row = self.conn.execute("SELECT snapshot,verification FROM design_manifests "
@@ -367,7 +441,7 @@ class CatalogService:
             raise ValueError("unknown design")
         if not isinstance(render_bytes, bytes) or not render_bytes:
             raise ValueError("render bytes required")
-        expected = {p["slot_id"] for p in manifest["products"]}
+        expected = {p["slot_id"] for p in manifest["products"] + manifest.get("custom_builds", [])}
         items = verification.get("items", [])
         if not isinstance(items, list) or len(items) != len(expected) or any(not isinstance(x, dict) for x in items):
             raise ValueError("review must cover every selected slot once")
@@ -377,7 +451,11 @@ class CatalogService:
             raise ValueError("review must report extra objects and room preservation")
         with self.conn:
             self.conn.execute("BEGIN IMMEDIATE")
-            quote = self.price_design(manifest["request"]["objects"])
+            objects = manifest["request"]["objects"]
+            quote = self.price_design(objects) if objects else self._price_by_key([])
+            quote.setdefault("complete", True)
+            _, material_quote = self._quote_builds(normalize_builds(manifest["request"].get("custom_builds", [])), strict=False)
+            quote = self._combined_quote(quote, material_quote, bool(manifest.get("custom_builds")))
             accepted = (all(x["status"] == "match" for x in items)
                         and not verification["extra_objects"] and verification["room_preserved"]
                         and quote.get("complete", False)
@@ -458,6 +536,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "properties": {
                 "query": {"type": "string",
                           "description": "Free text, e.g. 'dark grey 3-seat fabric sofa'."},
+                "material_kind": {"type": "string", "enum": ["wood", "hardware", "finish"], "description": "Procurement inputs for carpenter-built furniture; also set placeable_only=false."},
                 "render_ready_only": {"type": "boolean", "description": "Require downloaded catalog images for rendering."},
                 "reference_image_id": {"type": "string", "description": "Image or crop ID registered by the application for this session."},
                 "category": {"type": "string", "description":

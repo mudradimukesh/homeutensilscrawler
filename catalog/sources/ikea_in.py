@@ -16,6 +16,7 @@ import logging
 import re
 from typing import Any, Iterable
 
+from ..media import is_non_image_url
 from ..models import (
     Image, Product, Variant, axis_for, classify_design_category,
     parse_length_mm, parse_weight_kg,
@@ -159,7 +160,7 @@ class IkeaIndia(Source):
             if media.get("type") != "image":
                 continue
             c = media.get("content") or {}
-            if not c.get("url"):
+            if not c.get("url") or is_non_image_url(c["url"]):
                 continue
             images.append(
                 Image(
@@ -176,6 +177,7 @@ class IkeaIndia(Source):
                     images.append(Image(url=img["contentUrl"], role="MAIN_PRODUCT_IMAGE"))
                 elif isinstance(img, str):
                     images.append(Image(url=img, role="MAIN_PRODUCT_IMAGE"))
+        images = [im for im in images if not is_non_image_url(im.url)]
         images.sort(key=lambda i: _IMAGE_ROLE_RANK.get(i.role or "", 5))
         for i, im in enumerate(images):
             im.position = i

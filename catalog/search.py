@@ -24,6 +24,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from .embed import Embedder, load_matrix
+from .custom_builds import material_filter
 from .quality import geometry_for, PRICE_TTL_DAYS, _is_current
 from .taxonomy import expand_category
 
@@ -109,6 +110,7 @@ def _filter_sql(
     allow_store_only: bool = True,
     render_ready_only: bool = False,
     fresh_only: bool = False,
+    material_kind: str | None = None,
 ) -> tuple[str, list[Any]]:
     clauses, params = ["1=1"], []
     if eligible_only == "auto":
@@ -141,6 +143,10 @@ def _filter_sql(
                 raise ValueError("dimension limits must be finite positive numbers")
             clauses.append(f"{axis} > 0 AND {axis} <= ?")
             params.append(value)
+    if material_kind is not None:
+        predicate, values = material_filter(material_kind)
+        clauses.append(predicate)
+        params.extend(values)
     if fresh_only:
         clauses.append("price_current=1 AND julianday(last_seen) >= julianday('now', ?)")
         params.append(f"-{PRICE_TTL_DAYS} days")
@@ -181,6 +187,7 @@ def find_products(
     require_image_match: bool = False,
     render_ready_only: bool = False,
     fresh_only: bool = False,
+    material_kind: str | None = None,
 ) -> list[Match]:
     """Hybrid search over the catalogue. Works with keywords alone if nothing is embedded.
 
@@ -189,7 +196,7 @@ def find_products(
     """
     where, params = _filter_sql(design_category, min_price, max_price, source,
                                 in_stock_only, exclude, eligible_only,
-                                max_width_mm, max_depth_mm, max_height_mm, allow_store_only, render_ready_only, fresh_only)
+                                max_width_mm, max_depth_mm, max_height_mm, allow_store_only, render_ready_only, fresh_only, material_kind)
     allowed = {r["key"] for r in conn.execute(f"SELECT key FROM products WHERE {where}", params)}
     if not allowed:
         return []

@@ -127,7 +127,13 @@ def extract(product) -> dict[str, Any]:
             if w and h and max(w, h) >= 300:      # a sheet, not a screw head
                 specs["sheet_size_mm"] = [round(w), round(h)]
 
-    grades = sorted({g.upper().replace(" ", "") for g in _GRADE_RE.findall(name + " " + body)})
+    title_grades = {g.upper().replace(" ", "") for g in _GRADE_RE.findall(name)}
+    body_grades = {g.upper().replace(" ", "") for g in _GRADE_RE.findall(body)}
+    # Retain standards from the description without mixing alternative moisture grades.
+    moisture = {"MR", "BWR", "BWP"}
+    if title_grades & moisture:
+        body_grades -= moisture
+    grades = sorted(title_grades | body_grades)
     if grades:
         specs["grade"] = grades[:3]
 
@@ -190,3 +196,29 @@ SPEC_COLUMNS: dict[str, str] = {
     "pack_uom": "TEXT",
     "consumption_uom": "TEXT",
 }
+
+
+def variant_specs(parent: dict, title: str, options: dict, product_name: str = "") -> dict:
+    """Resolve orderable thickness/size from variant options, not a family description."""
+    specs = {k: v for k, v in parent.items() if k not in ("thickness_mm", "sheet_size_mm", "size_range_min_mm", "size_range_max_mm")}
+    title_grades = {g.upper().replace(" ", "") for g in _GRADE_RE.findall(product_name)}
+    if title_grades & {"MR", "BWR", "BWP"}:
+        specs["grade"] = sorted((set(specs.get("grade", [])) - {"MR", "BWR", "BWP"}) | title_grades)
+    values = [str(v) for v in options.values()] if isinstance(options, dict) else []
+    source = " / ".join([title or "", *values, product_name])
+    thickness = re.search(r"(?<![\d.])(\d+(?:\.\d+)?)\s*mm\b", source, re.I)
+    # A fitting's 450 mm length is not its thickness. Only an explicit option
+    # or an already sheet-specific parent can provide thickness.
+    thick_option = next((str(v) for k, v in options.items() if "thick" in k.lower()), "") if isinstance(options, dict) else ""
+    thick_match = _THICKNESS_RE.search(thick_option)
+    if thick_match:
+        specs["thickness_mm"] = float(thick_match.group(1))
+    elif thickness and ("thickness_mm" in parent or SHEET_GOOD_RE.search(product_name)):
+        specs["thickness_mm"] = float(thickness.group(1))
+    size = re.search(r"(\d+(?:\.\d+)?)\s*(ft|feet|mm|cm|m|'|\")?\s*[xX×]\s*(\d+(?:\.\d+)?)\s*(ft|feet|mm|cm|m|'|\")", source)
+    if size:
+        unit_a, unit_b = size.group(2) or size.group(4), size.group(4)
+        aliases = {"'": "ft", "\"": "inch"}
+        specs["sheet_size_mm"] = [round(_mm(size.group(1), aliases.get(unit_a, unit_a))),
+                                    round(_mm(size.group(3), aliases.get(unit_b, unit_b)))]
+    return specs

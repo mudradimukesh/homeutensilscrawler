@@ -188,10 +188,15 @@ def embed_catalog(
             paths, keep = [], []
             for r in part:
                 p = Path(r["local_path"])
-                if p.exists():
+                try:
+                    # One bad download must not discard the other 31 images.
+                    from PIL import Image as PILImage
+                    with PILImage.open(p) as image:
+                        image.verify()
                     paths.append(p)
                     keep.append(r)
-                else:
+                except (OSError, ValueError, SyntaxError):
+                    log.warning("invalid or missing image, skipping only %s", p.name)
                     counts["skipped_images"] += 1
             if not paths:
                 continue

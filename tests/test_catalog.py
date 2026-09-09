@@ -873,7 +873,11 @@ def test_image_download_stops_at_the_budget(tmp_path="/tmp"):
         """Distinct 4 KB payloads. Identical bytes would deduplicate to one file
         and the directory would never grow, so the test would pass vacuously."""
         def get_bytes(self, url):
-            body = url.encode()
+            import io
+            from PIL import Image as PILImage
+            buffer = io.BytesIO()
+            PILImage.new("RGB", (4, 4), (int(url.rsplit("/", 1)[1].split(".")[0]), 0, 0)).save(buffer, format="PNG")
+            body = buffer.getvalue()
             return body + b"\x00" * (4096 - len(body))
 
     start = dir_size(images) if images.exists() else 0

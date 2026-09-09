@@ -7,6 +7,7 @@ brand assets repeat across pack sizes) share one file and one embedding.
 from __future__ import annotations
 
 import hashlib
+import io
 import logging
 import sqlite3
 import threading
@@ -17,6 +18,7 @@ from urllib.parse import urlparse
 
 from .budget import DiskBudget, human
 from .http import Fetcher
+from .media import is_non_image_url
 
 log = logging.getLogger(__name__)
 
@@ -109,8 +111,18 @@ def download_missing(
     def work(row):
         if stop.is_set():
             return row, None, "stopped"
+        if is_non_image_url(row["url"]):
+            return row, None, None
         blob = fetcher.get_bytes(row["url"])
         if not blob:
+            return row, None, None
+        # Retailers sometimes return an HTML error page with HTTP 200.
+        from PIL import Image as PILImage
+        try:
+            with PILImage.open(io.BytesIO(blob)) as image:
+                image.verify()
+        except (OSError, ValueError, SyntaxError):
+            log.warning("not an image: %s", row["url"])
             return row, None, None
         digest = hashlib.sha256(blob).hexdigest()
         path = image_dir / digest[:2] / f"{digest}{_extension(row['url'], blob)}"
@@ -131,6 +143,14 @@ def download_missing(
     # run killed at hour nine records nothing: the files are on disk, the
     # database has never heard of them, and the next run re-fetches every byte.
     done = 0
+    pending_updates = []
+
+    def flush():
+        if pending_updates:
+            with conn:
+                conn.executemany("UPDATE product_images SET local_path=?, sha256=? WHERE product_key=? AND position=?", pending_updates)
+            pending_updates.clear()
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for row, path, meta in pool.map(work, rows):
             if meta == "stopped":
@@ -141,18 +161,14 @@ def download_missing(
                 continue
             digest, existed = meta
             counts["deduped" if existed else "downloaded"] += 1
-            conn.execute(
-                "UPDATE product_images SET local_path=?, sha256=? "
-                "WHERE product_key=? AND position=?",
-                (str(path), digest, row["product_key"], row["position"]),
-            )
+            pending_updates.append((str(path), digest, row["product_key"], row["position"]))
             done += 1
             if done % commit_every == 0:
-                conn.commit()
+                flush()
                 log.info("images %d/%d  downloaded=%d deduped=%d failed=%d",
                          done, len(rows), counts["downloaded"], counts["deduped"],
                          counts["failed"])
-    conn.commit()
+    flush()
     if counts["stopped"] and budget is not None:
         log.warning("image download stopped at %s of %s; %d images still pending",
                     human(budget.used), human(budget.limit),

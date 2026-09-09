@@ -53,7 +53,7 @@ def handle(service, action, body):
     if action == "product":
         return service.get_product(body["product_key"])
     if action == "manifest":
-        return service.save_manifest(body["objects"], budget=body.get("budget"), design_id=body.get("design_id"))
+        return service.save_manifest(body["objects"], budget=body.get("budget"), design_id=body.get("design_id"), custom_builds=body.get("custom_builds"))
     if action == "get-manifest":
         return service.get_manifest(body["design_id"])
     if action == "asset":
