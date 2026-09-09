@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import sqlite3
 from dataclasses import asdict, dataclass, field
@@ -23,7 +24,7 @@ from typing import Any, Sequence
 import numpy as np
 
 from .embed import Embedder, load_matrix
-from .quality import geometry_for
+from .quality import geometry_for, PRICE_TTL_DAYS, _is_current
 from .taxonomy import expand_category
 
 log = logging.getLogger(__name__)
@@ -102,6 +103,12 @@ def _filter_sql(
     in_stock_only: bool,
     exclude: Sequence[str] | None,
     eligible_only: bool | str = False,
+    max_width_mm: float | None = None,
+    max_depth_mm: float | None = None,
+    max_height_mm: float | None = None,
+    allow_store_only: bool = True,
+    render_ready_only: bool = False,
+    fresh_only: bool = False,
 ) -> tuple[str, list[Any]]:
     clauses, params = ["1=1"], []
     if eligible_only == "auto":
@@ -124,7 +131,23 @@ def _filter_sql(
         clauses.append("source = ?")
         params.append(source)
     if in_stock_only:
-        clauses.append("availability IN ('in_stock','store_only')")
+        clauses.append("availability IN ('in_stock','store_only')" if allow_store_only
+                       else "availability = 'in_stock'")
+    for axis, value in (("width_mm", max_width_mm),
+                        ("COALESCE(NULLIF(depth_mm,0),length_mm)", max_depth_mm),
+                        ("height_mm", max_height_mm)):
+        if value is not None:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError("dimension limits must be finite positive numbers")
+            clauses.append(f"{axis} > 0 AND {axis} <= ?")
+            params.append(value)
+    if fresh_only:
+        clauses.append("price_current=1 AND julianday(last_seen) >= julianday('now', ?)")
+        params.append(f"-{PRICE_TTL_DAYS} days")
+    if render_ready_only:
+        clauses.append("EXISTS (SELECT 1 FROM product_images i WHERE i.product_key=products.key "
+                       "AND i.local_path IS NOT NULL AND i.sha256 IS NOT NULL)")
+        clauses.append("(SELECT COUNT(*) FROM product_variants v WHERE v.product_key=products.key) <= 1")
     if exclude:
         clauses.append(f"key NOT IN ({','.join('?' * len(exclude))})")
         params += list(exclude)
@@ -151,6 +174,13 @@ def find_products(
     candidate_pool: int = 400,
     eligible_only: bool | str = False,
     collapse_families: bool = False,
+    max_width_mm: float | None = None,
+    max_depth_mm: float | None = None,
+    max_height_mm: float | None = None,
+    allow_store_only: bool = True,
+    require_image_match: bool = False,
+    render_ready_only: bool = False,
+    fresh_only: bool = False,
 ) -> list[Match]:
     """Hybrid search over the catalogue. Works with keywords alone if nothing is embedded.
 
@@ -158,7 +188,8 @@ def find_products(
     room; "auto" applies that test only to categories that are placed at all.
     """
     where, params = _filter_sql(design_category, min_price, max_price, source,
-                                in_stock_only, exclude, eligible_only)
+                                in_stock_only, exclude, eligible_only,
+                                max_width_mm, max_depth_mm, max_height_mm, allow_store_only, render_ready_only, fresh_only)
     allowed = {r["key"] for r in conn.execute(f"SELECT key FROM products WHERE {where}", params)}
     if not allowed:
         return []
@@ -172,8 +203,9 @@ def find_products(
             weights = ",".join(str(w) for w in _BM25_WEIGHTS)
             rows = conn.execute(
                 f"SELECT key FROM products_fts WHERE products_fts MATCH ? "
+                f"AND key IN (SELECT key FROM products WHERE {where}) "
                 f"ORDER BY bm25(products_fts, {weights}) LIMIT ?",
-                (fq, candidate_pool),
+                [fq] + params + [candidate_pool],
             ).fetchall()
             keys = [r["key"] for r in rows if r["key"] in allowed]
             if keys:
@@ -198,12 +230,16 @@ def find_products(
         except RuntimeError as exc:
             log.warning("vector search unavailable (%s); keyword only", exc)
 
+    if require_image_match and not any(name == "clip_image_query" and ranking
+                                       for name, ranking in rankings):
+        raise RuntimeError("visual search unavailable: image embeddings and a working embedder are required")
+
     if not rankings:
         # Nothing to rank on — fall back to the cheapest in-scope products so a
         # category-only query ("any 600x600 floor tile") still returns something.
         rows = conn.execute(
             f"SELECT key FROM products WHERE {where} ORDER BY price IS NULL, price LIMIT ?",
-            params + [k],
+            params + [candidate_pool if collapse_families else k],
         ).fetchall()
         rankings.append(("fallback", _rank_map([r["key"] for r in rows])))
 
@@ -221,7 +257,7 @@ def find_products(
     # Over-fetch, then keep the best SKU per model line. Without this, "five
     # wardrobes" can come back as five sizes of one range: measured on the live
     # catalogue, wardrobes average five SKUs per family.
-    hydrated = _hydrate(conn, ranked[: max(k * 6, 60)], signals)
+    hydrated = _hydrate(conn, ranked, signals)
     best: list[Match] = []
     seen: set[str] = set()
     for m in hydrated:
@@ -327,7 +363,7 @@ def _hydrate(conn, scored: Sequence[tuple[str, float]], signals: dict) -> list[M
             family_key=r["family_key"], family_label=r["family_label"],
             variant_label=r["variant_label"],
             price_state=("unknown" if r["price"] is None
-                         else "fresh" if r["price_current"] else "stale"),
+                         else "fresh" if r["price_current"] and _is_current(r["last_seen"], PRICE_TTL_DAYS) else "stale"),
             image=images.get(key), score=round(score, 6), signals=signals.get(key, {}),
         ))
     return out

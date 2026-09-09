@@ -19,6 +19,13 @@ parse costs about a millisecond and why the parsers survive theme changes.
 [**Design spec**](docs/DESIGN.md) — the data model, the crawl-ordering and completeness
 decisions with the measurements behind them, the model tool boundary, and the open items.
 
+## Upload application integration
+
+The catalog API and persisted design manifests now support the upload workflow in
+`interiorDesign`. See [setup, data reuse and API contract](docs/UPLOAD-INTEGRATION.md).
+Product selection and pricing are exact-key operations; rendered product appearance
+is checked separately and is not guaranteed by a generation prompt.
+
 ## Quickstart
 
 ```bash
@@ -171,7 +178,7 @@ When you hit it, the stores are not equally disposable:
 | `cache/` | fetched HTML, gzipped | rebuildable, but it is the **cheap cold source**: it is what lets you improve the parser tomorrow and recover a field you did not normalise today, without re-crawling |
 | `images/` | product photography, content-addressed | **treat as durable**. Re-downloadable only while the retailer still serves that URL — listings get replaced, reordered and discontinued, and a saved design that refers to `(sku, image sha256)` must still render years later |
 | `*.jsonl` | canonical normalised observations | **durable**. The replayable record of what each crawl saw |
-| `catalog.db` | query state | derived; rebuilt from JSONL by `load` |
+| `catalog.db` | query state plus saved design sessions, manifests and assets | product query tables can be rebuilt; back up the DB to preserve application state |
 
 Delete `thumbs/` first, then `cache/` if you must. `images/` and the JSONL are the snapshot.
 

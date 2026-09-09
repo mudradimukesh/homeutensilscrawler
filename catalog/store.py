@@ -31,6 +31,37 @@ SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
+-- Application state survives refreshes; snapshots intentionally have no product FK.
+CREATE TABLE IF NOT EXISTS catalog_sessions (
+    session_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS catalog_issued (
+    session_id TEXT NOT NULL REFERENCES catalog_sessions(session_id),
+    product_key TEXT NOT NULL,
+    PRIMARY KEY(session_id, product_key)
+);
+CREATE TABLE IF NOT EXISTS catalog_query_images (
+    session_id TEXT NOT NULL REFERENCES catalog_sessions(session_id),
+    image_id TEXT NOT NULL,
+    image_bytes BLOB NOT NULL,
+    PRIMARY KEY(session_id, image_id)
+);
+CREATE TABLE IF NOT EXISTS design_manifests (
+    design_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES catalog_sessions(session_id),
+    created_at TEXT NOT NULL,
+    snapshot TEXT NOT NULL,
+    verification TEXT
+);
+
+CREATE TABLE IF NOT EXISTS design_assets (
+    design_id TEXT NOT NULL REFERENCES design_manifests(design_id),
+    asset TEXT NOT NULL,
+    bytes BLOB NOT NULL,
+    PRIMARY KEY(design_id, asset)
+);
+
 CREATE TABLE IF NOT EXISTS products (
     key              TEXT PRIMARY KEY,          -- '<source>:<source_id>'
     source           TEXT NOT NULL,
